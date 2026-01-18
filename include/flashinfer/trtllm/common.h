@@ -285,6 +285,8 @@ static inline size_t get_size_in_bytes(size_t n, Data_type dtype) {
       return n;
     case DATA_TYPE_E5M2:
       return n;
+    case DATA_TYPE_E2M1:
+      return n;  // NVFP4 is packed as uint8 (2 FP4 values per uint8)
     default:
       FLASHINFER_CHECK(false, "FMHA Data Type is not supported.");
       return 0;
