@@ -207,16 +207,24 @@ def create_kv_cache(
         # Reshape scale factors: [total_tokens, head_dim // 16] -> [original_shape[:-1], head_dim // 16]
         k_scale_shape = (*k_cache.shape[:-1], head_dim // 16)
         v_scale_shape = (*v_cache.shape[:-1], head_dim // 16)
-        k_scale = k_scale_flat.reshape(k_scale_shape).to(torch.float8_e4m3fn)
-        v_scale = v_scale_flat.reshape(v_scale_shape).to(torch.float8_e4m3fn)
+        k_scale = k_scale_flat.view(torch.float8_e4m3fn).reshape(k_scale_shape)
+        v_scale = v_scale_flat.view(torch.float8_e4m3fn).reshape(v_scale_shape)
 
         # For reference, use dequantized values
         k_cache_dequant = cast_from_fp4(k_cache_nvfp4_flat.view(torch.uint8)).reshape(
             k_cache.shape
-        ) * k_scale_flat.reshape(k_scale_shape).unsqueeze(-1)
+        )
         v_cache_dequant = cast_from_fp4(v_cache_nvfp4_flat.view(torch.uint8)).reshape(
             v_cache.shape
-        ) * v_scale_flat.reshape(v_scale_shape).unsqueeze(-1)
+        )
+        k_cache_dequant = (
+            k_cache_dequant.view(*k_cache.shape[:-1], head_dim // 16, 16)
+            * k_scale.float().unsqueeze(-1)
+        ).reshape(k_cache.shape)
+        v_cache_dequant = (
+            v_cache_dequant.view(*v_cache.shape[:-1], head_dim // 16, 16)
+            * v_scale.float().unsqueeze(-1)
+        ).reshape(v_cache.shape)
         ref_kv_cache = torch.stack([k_cache_dequant, v_cache_dequant], dim=1)
 
         # Update k_cache and v_cache to NVFP4 format
