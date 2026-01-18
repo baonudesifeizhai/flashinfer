@@ -2124,6 +2124,9 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    k_scale_factor: Optional[torch.Tensor] = None,
+    v_scale_factor: Optional[torch.Tensor] = None,
+    kv_sf_scale: Optional[float] = 1.0,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2137,6 +2140,8 @@ def trtllm_batch_decode_with_kv_cache(
         If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
         or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
         The first tensor is the key cache, and the second tensor is the value cache.
+        For NVFP4 KV Cache, the tensors should be uint8 dtype with shape [num_pages, num_kv_heads, page_size, head_dim // 2] (HND layout)
+        or [num_pages, page_size, num_kv_heads, head_dim // 2] (NHD layout), and :attr:`k_scale_factor` and :attr:`v_scale_factor` must be provided.
 
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
@@ -2207,6 +2212,20 @@ def trtllm_batch_decode_with_kv_cache(
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
+    k_scale_factor : Optional[torch.Tensor] = None
+        Scale factor tensor for NVFP4 K cache. Required when K cache is uint8 (NVFP4 format).
+        Shape and dtype should match the scale factor layout for NVFP4 quantization.
+        dtype: ``torch.float8_e4m3fn``.
+
+    v_scale_factor : Optional[torch.Tensor] = None
+        Scale factor tensor for NVFP4 V cache. Required when V cache is uint8 (NVFP4 format).
+        Shape and dtype should match the scale factor layout for NVFP4 quantization.
+        dtype: ``torch.float8_e4m3fn``.
+
+    kv_sf_scale : Optional[float] = 1.0
+        Scale value for KV scale factors. Only used when NVFP4 KV Cache is detected.
+        Defaults to 1.0.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2272,6 +2291,31 @@ def trtllm_batch_decode_with_kv_cache(
             # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
+
+        # Detect NVFP4 KV Cache: check if k_cache and v_cache are uint8 (NVFP4 container type)
+        is_nvfp4_kv = k_cache.dtype == torch.uint8 and v_cache.dtype == torch.uint8
+
+        # If NVFP4 KV Cache is detected, validate scale factors are provided
+        if is_nvfp4_kv:
+            if k_scale_factor is None or v_scale_factor is None:
+                raise ValueError(
+                    "NVFP4 KV Cache detected (uint8 dtype), but k_scale_factor and v_scale_factor must be provided. "
+                    "Please provide scale factor tensors for both K and V caches."
+                )
+            # Validate scale factor dtypes
+            if k_scale_factor.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    f"k_scale_factor must be float8_e4m3fn, got {k_scale_factor.dtype}"
+                )
+            if v_scale_factor.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    f"v_scale_factor must be float8_e4m3fn, got {v_scale_factor.dtype}"
+                )
+            # Validate that head_dim is even (required for NVFP4 packing)
+            if k_cache.shape[-1] % 2 != 0:
+                raise ValueError(
+                    f"NVFP4 KV Cache requires even head_dim, got {k_cache.shape[-1]}"
+                )
 
         run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         sm_count = get_device_sm_count(query.device)
@@ -2363,6 +2407,11 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
+        # Prepare KV scale factors for NVFP4 KV Cache
+        k_sf = k_scale_factor if is_nvfp4_kv else None
+        v_sf = v_scale_factor if is_nvfp4_kv else None
+        kv_sf_scale_val = kv_sf_scale if is_nvfp4_kv else 1.0
+
         run_func(
             out,
             out_scale_factor,
@@ -2387,6 +2436,9 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            k_sf,
+            v_sf,
+            kv_sf_scale_val,
         )
 
         return (
