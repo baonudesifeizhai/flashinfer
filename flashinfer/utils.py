@@ -643,6 +643,88 @@ def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def validate_nvfp4_kv_cache_scale_factors(
+    k_cache: torch.Tensor,
+    v_cache: Optional[torch.Tensor],
+    k_scale_factor: Optional[torch.Tensor],
+    v_scale_factor: Optional[torch.Tensor],
+    check_head_dim: bool = True,
+) -> bool:
+    """
+    Validate NVFP4 KV Cache and its scale factors.
+
+    Parameters
+    ----------
+    k_cache : torch.Tensor
+        K cache tensor. If it's uint8, it's treated as NVFP4 format.
+    v_cache : Optional[torch.Tensor]
+        V cache tensor. If None, only k_cache is checked. If provided, both must be uint8 for NVFP4.
+    k_scale_factor : Optional[torch.Tensor]
+        Scale factor tensor for K cache. Required if NVFP4 is detected.
+    v_scale_factor : Optional[torch.Tensor]
+        Scale factor tensor for V cache. Required if NVFP4 is detected.
+    check_head_dim : bool
+        Whether to check that head_dim is even (required for NVFP4 packing). Defaults to True.
+
+    Returns
+    -------
+    bool
+        True if NVFP4 KV Cache is detected, False otherwise.
+
+    Raises
+    ------
+    ValueError
+        If NVFP4 is detected but scale factors are missing or invalid.
+    """
+    # Detect NVFP4: check if cache(s) are uint8 (NVFP4 container type)
+    if v_cache is not None:
+        is_nvfp4_kv = k_cache.dtype == torch.uint8 and v_cache.dtype == torch.uint8
+    else:
+        is_nvfp4_kv = k_cache.dtype == torch.uint8
+
+    if not is_nvfp4_kv:
+        return False
+
+    # If NVFP4 KV Cache is detected, validate scale factors are provided
+    if k_scale_factor is None or v_scale_factor is None:
+        raise ValueError(
+            "NVFP4 KV Cache detected (uint8 dtype), but k_scale_factor and v_scale_factor must be provided. "
+            "The kernel will fuse unpack + attention inside, avoiding the need for an extra dequant buffer."
+        )
+
+    # Validate scale factor dtypes
+    if k_scale_factor.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"k_scale_factor must be float8_e4m3fn, got {k_scale_factor.dtype}"
+        )
+    if v_scale_factor.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"v_scale_factor must be float8_e4m3fn, got {v_scale_factor.dtype}"
+        )
+
+    # Validate device matching
+    if k_scale_factor.device != k_cache.device:
+        raise ValueError(
+            f"k_scale_factor device mismatch: expected {k_cache.device}, got {k_scale_factor.device}"
+        )
+    if v_scale_factor.device != k_cache.device:
+        raise ValueError(
+            f"v_scale_factor device mismatch: expected {k_cache.device}, got {v_scale_factor.device}"
+        )
+    if v_cache is not None and v_scale_factor.device != v_cache.device:
+        raise ValueError(
+            f"v_scale_factor device mismatch: expected {v_cache.device}, got {v_scale_factor.device}"
+        )
+
+    # Validate that head_dim is even (required for NVFP4 packing)
+    if check_head_dim:
+        head_dim = k_cache.shape[-1]
+        if head_dim % 2 != 0:
+            raise ValueError(f"NVFP4 KV Cache requires even head_dim, got {head_dim}")
+
+    return True
+
+
 class FP4Tensor:
     """Wrapper class for FP4 tensors.
 

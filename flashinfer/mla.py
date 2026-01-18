@@ -28,6 +28,7 @@ from .utils import (
     determine_mla_backend,
     device_support_pdl,
     get_compute_capability,
+    validate_nvfp4_kv_cache_scale_factors,
     get_device_sm_count,
     log2e,
 )
@@ -536,6 +537,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
     backend: str = "auto",
+    k_scale_factor: Optional[torch.Tensor] = None,
+    v_scale_factor: Optional[torch.Tensor] = None,
+    kv_sf_scale: Optional[float] = 1.0,
 ) -> torch.Tensor:
     """
     Parameters
@@ -561,6 +565,16 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+    k_scale_factor : Optional[torch.Tensor] = None
+        Scale factor tensor for NVFP4 K cache. Required when KV cache is uint8 (NVFP4 format).
+        Shape should match the page structure: [num_pages, page_size, (head_dim_ckv + head_dim_kpe) / 16].
+        The kernel will fuse unpack + attention inside, avoiding the need for an extra dequant buffer.
+    v_scale_factor : Optional[torch.Tensor] = None
+        Scale factor tensor for NVFP4 V cache. Required when KV cache is uint8 (NVFP4 format).
+        Shape should match the page structure: [num_pages, page_size, (head_dim_ckv + head_dim_kpe) / 16].
+        The kernel will fuse unpack + attention inside, avoiding the need for an extra dequant buffer.
+    kv_sf_scale : Optional[float] = 1.0
+        Additional scale factor for KV scale factors. Defaults to 1.0.
 
     Note
     ----
@@ -664,6 +678,22 @@ def trtllm_batch_decode_with_kv_cache_mla(
         max_q_len = query.size(1)
         query = query.flatten(0, 1)  # [B*S, H, D]
 
+        # Validate NVFP4 KV Cache and scale factors
+        # For MLA, kv_cache is packed [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe]
+        # so we use the same tensor for both k and v
+        is_nvfp4_kv = validate_nvfp4_kv_cache_scale_factors(
+            k_cache=kv_cache,
+            v_cache=None,  # MLA uses packed cache, so v_cache is None
+            k_scale_factor=k_scale_factor,
+            v_scale_factor=v_scale_factor,
+            check_head_dim=False,  # MLA has special shape, skip head_dim check
+        )
+
+        # Prepare KV scale factors for NVFP4 KV Cache
+        k_sf = k_scale_factor if is_nvfp4_kv else None
+        v_sf = v_scale_factor if is_nvfp4_kv else None
+        kv_sf_scale_val = kv_sf_scale if is_nvfp4_kv else 1.0
+
         run_func(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -688,6 +718,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             None,  # cum_seq_lens_q
+            k_sf,  # k_scale_factor for NVFP4
+            v_sf,  # v_scale_factor for NVFP4
+            kv_sf_scale_val,  # kv_sf_scale
         )
 
         return out

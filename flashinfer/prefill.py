@@ -63,6 +63,7 @@ from .utils import (
     register_fake_op,
     ceil_div,
     round_up,
+    validate_nvfp4_kv_cache_scale_factors,
 )
 
 
@@ -3571,30 +3572,14 @@ def trtllm_batch_context_with_kv_cache(
         k_cache = k_cache.transpose(-3, -2)
         v_cache = v_cache.transpose(-3, -2)
 
-    # Detect NVFP4 KV Cache: check if k_cache and v_cache are uint8 (NVFP4 container type)
-    is_nvfp4_kv = k_cache.dtype == torch.uint8 and v_cache.dtype == torch.uint8
-
-    # If NVFP4 KV Cache is detected, validate scale factors are provided
-    if is_nvfp4_kv:
-        if k_scale_factor is None or v_scale_factor is None:
-            raise ValueError(
-                "NVFP4 KV Cache detected (uint8 dtype), but k_scale_factor and v_scale_factor must be provided. "
-                "Please provide scale factor tensors for both K and V caches."
-            )
-        # Validate scale factor dtypes
-        if k_scale_factor.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                f"k_scale_factor must be float8_e4m3fn, got {k_scale_factor.dtype}"
-            )
-        if v_scale_factor.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                f"v_scale_factor must be float8_e4m3fn, got {v_scale_factor.dtype}"
-            )
-        # Validate that head_dim is even (required for NVFP4 packing)
-        if k_cache.shape[-1] % 2 != 0:
-            raise ValueError(
-                f"NVFP4 KV Cache requires even head_dim, got {k_cache.shape[-1]}"
-            )
+    # Validate NVFP4 KV Cache and scale factors
+    is_nvfp4_kv = validate_nvfp4_kv_cache_scale_factors(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_scale_factor=k_scale_factor,
+        v_scale_factor=v_scale_factor,
+        check_head_dim=True,
+    )
 
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
