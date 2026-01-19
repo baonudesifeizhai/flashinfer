@@ -911,9 +911,8 @@ def _test_trtllm_batch_decode(
     sm_scale = float(1.0 / (head_dim**0.5))
 
     # Build reference output
-    # For NVFP4 KV cache, use uint8 as kv_data_type (the actual storage type)
-    # ref_kv_cache.dtype is float32 (dequantized), but the actual kv_cache is uint8
-    kv_data_type_for_plan = torch.uint8 if kv_dtype == "nvfp4" else ref_kv_cache.dtype
+    # For reference wrapper, use ref_kv_cache.dtype (float32 for nvfp4, actual dtype for others)
+    # For actual trtllm-gen wrapper, use uint8 for nvfp4 (the actual storage type)
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -923,7 +922,7 @@ def _test_trtllm_batch_decode(
         "head_dim": head_dim,
         "page_size": page_size,
         "pos_encoding_mode": "NONE",
-        "kv_data_type": kv_data_type_for_plan,
+        "kv_data_type": ref_kv_cache.dtype,  # Use ref_kv_cache dtype for reference wrapper
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
