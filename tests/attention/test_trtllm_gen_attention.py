@@ -110,12 +110,9 @@ def create_kv_cache(
     num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
     num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
-    if kv_dtype not in [
-        "fp8",
-        "nvfp4",
-    ]:  # for fp8 and nvfp4, create with high precision to generate scale.
+    if kv_dtype != "fp8":  # for fp8, create with high precision to generate scale.
         assert kv_dtype == ref_kv_dtype, (
-            "kv_dtype and ref_kv_dtype must be the same for non-fp8/non-nvfp4 kv_cache"
+            "kv_dtype and ref_kv_dtype must be the same for non-fp8 kv_cache"
         )
 
     # Create cache with appropriate layout
@@ -168,70 +165,6 @@ def create_kv_cache(
             ],
             dim=1,
         )
-    elif kv_dtype == "nvfp4":
-        # Quantize to NVFP4 format using FlashInfer's fp4_quantize
-        import flashinfer.fp4_quantization as fp4_quant
-
-        # Reshape to 2D [total_tokens, head_dim] for quantization
-        k_cache_flat = k_cache.reshape(-1, head_dim)
-        v_cache_flat = v_cache.reshape(-1, head_dim)
-
-        # Global scale factor of 1.0
-        global_scale = torch.tensor([1.0], dtype=torch.float32, device=k_cache.device)
-
-        # Quantize K cache with linear layout (is_sf_swizzled_layout=False)
-        k_cache_nvfp4_flat, k_scale_flat = fp4_quant.fp4_quantize(
-            k_cache_flat,
-            global_scale,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,  # Use linear layout for KV cache
-            is_sf_8x4_layout=False,
-            enable_pdl=None,
-        )
-
-        # Quantize V cache with linear layout
-        v_cache_nvfp4_flat, v_scale_flat = fp4_quant.fp4_quantize(
-            v_cache_flat,
-            global_scale,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,  # Use linear layout for KV cache
-            is_sf_8x4_layout=False,
-            enable_pdl=None,
-        )
-
-        # Reshape back to original shape (head_dim becomes head_dim // 2 for uint8)
-        k_cache_nvfp4 = k_cache_nvfp4_flat.reshape(*k_cache.shape[:-1], head_dim // 2)
-        v_cache_nvfp4 = v_cache_nvfp4_flat.reshape(*v_cache.shape[:-1], head_dim // 2)
-
-        # Reshape scale factors: [total_tokens, head_dim // 16] -> [original_shape[:-1], head_dim // 16]
-        k_scale_shape = (*k_cache.shape[:-1], head_dim // 16)
-        v_scale_shape = (*v_cache.shape[:-1], head_dim // 16)
-        k_scale = k_scale_flat.reshape(k_scale_shape).to(torch.float8_e4m3fn)
-        v_scale = v_scale_flat.reshape(v_scale_shape).to(torch.float8_e4m3fn)
-
-        # For reference, dequantize for comparison
-        # Convert scale factors to float32 for multiplication (FP8 doesn't support direct multiplication)
-        k_scale_flat_float = k_scale_flat.to(torch.float32)
-        v_scale_flat_float = v_scale_flat.to(torch.float32)
-        k_cache_dequant_flat = cast_from_fp4(
-            k_cache_nvfp4_flat.view(torch.uint8)
-        ).reshape(-1, head_dim // 16, 16) * k_scale_flat_float.reshape(
-            -1, head_dim // 16, 1
-        )
-        v_cache_dequant_flat = cast_from_fp4(
-            v_cache_nvfp4_flat.view(torch.uint8)
-        ).reshape(-1, head_dim // 16, 16) * v_scale_flat_float.reshape(
-            -1, head_dim // 16, 1
-        )
-        k_cache_dequant = k_cache_dequant_flat.reshape(k_cache.shape)
-        v_cache_dequant = v_cache_dequant_flat.reshape(v_cache.shape)
-        ref_kv_cache = torch.stack([k_cache_dequant, v_cache_dequant], dim=1)
-
-        # Update k_cache and v_cache to NVFP4 format
-        k_cache = k_cache_nvfp4
-        v_cache = v_cache_nvfp4
     else:
         k_scale = v_scale = 1.0
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
@@ -911,9 +844,6 @@ def _test_trtllm_batch_decode(
     sm_scale = float(1.0 / (head_dim**0.5))
 
     # Build reference output
-    # For NVFP4 KV cache, use uint8 as kv_data_type (the actual storage type)
-    # ref_kv_cache.dtype is float32 (dequantized), but the actual kv_cache is uint8
-    kv_data_type_for_plan = torch.uint8 if kv_dtype == "nvfp4" else ref_kv_cache.dtype
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -923,7 +853,7 @@ def _test_trtllm_batch_decode(
         "head_dim": head_dim,
         "page_size": page_size,
         "pos_encoding_mode": "NONE",
-        "kv_data_type": kv_data_type_for_plan,
+        "kv_data_type": ref_kv_cache.dtype,
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
@@ -986,17 +916,8 @@ def _test_trtllm_batch_decode(
         mask = None
 
     # Run decode function call with specified backend
-    # For NVFP4 KV cache, k_scale and v_scale are tensors, not scalars
-    # They are passed separately as k_scale_factor and v_scale_factor
-    # So we use 1.0 for bmm1_scale and bmm2_scale when using NVFP4
-    if kv_dtype == "nvfp4":
-        bmm1_scale = (
-            q_scale * sm_scale
-        )  # k_scale is handled separately via k_scale_factor
-        bmm2_scale = 1.0 / o_scale  # v_scale is handled separately via v_scale_factor
-    else:
-        bmm1_scale = q_scale * k_scale * sm_scale
-        bmm2_scale = v_scale / o_scale
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale / o_scale
     if isinstance(bmm1_scale, torch.Tensor) and not device_scale:
         bmm1_scale = bmm1_scale.item()
     elif not isinstance(bmm1_scale, torch.Tensor) and device_scale:
@@ -1011,10 +932,6 @@ def _test_trtllm_batch_decode(
         q_input = make_query_non_contiguous(q, num_qo_heads, head_dim)
     else:
         q_input = q.contiguous()
-
-    # Pass scale factors for NVFP4 KV cache
-    k_scale_factor = k_scale if kv_dtype == "nvfp4" else None
-    v_scale_factor = v_scale if kv_dtype == "nvfp4" else None
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
@@ -1039,8 +956,6 @@ def _test_trtllm_batch_decode(
         mask=mask,
         max_q_len=max_q_len if max_q_len is not None else None,
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
-        k_scale_factor=k_scale_factor,
-        v_scale_factor=v_scale_factor,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -1179,8 +1094,6 @@ def _test_trtllm_batch_decode(
         ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
-        ("bf16", "nvfp4", "bf16"),
-        ("fp16", "nvfp4", "fp16"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
@@ -1209,10 +1122,6 @@ def test_trtllm_batch_decode(
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
-
-    # xqa backend does not support nvfp4 KV cache
-    if backend == "xqa" and kv_dtype == "nvfp4":
-        pytest.skip("xqa backend does not support nvfp4 KV cache")
 
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
