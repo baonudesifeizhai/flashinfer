@@ -1234,6 +1234,14 @@ def test_trtllm_batch_decode(
             "E2M1 kernels from TensorRT-LLM do not include page_size=16."
         )
 
+    # nvfp4 KV cache does not support enable_sink=True (E2M1 kernels from TensorRT-LLM)
+    # The available kernels are: PersistentContext and StaticContext, but no sink support
+    if kv_dtype == "nvfp4" and enable_sink:
+        pytest.skip(
+            "nvfp4 KV cache does not support enable_sink=True. "
+            "E2M1 kernels from TensorRT-LLM only support PersistentContext and StaticContext."
+        )
+
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
         backend,
@@ -1367,6 +1375,14 @@ def test_trtllm_batch_decode_head_dim_256(
             f"nvfp4 KV cache only supports page_size=32 and 64, got {page_size}. "
             "E2M1 kernels from TensorRT-LLM do not include page_size=16."
         )
+
+    # nvfp4 KV cache does not support enable_sink=True (E2M1 kernels from TensorRT-LLM)
+    if kv_dtype == "nvfp4" and enable_sink:
+        pytest.skip(
+            "nvfp4 KV cache does not support enable_sink=True. "
+            "E2M1 kernels from TensorRT-LLM only support PersistentContext and StaticContext."
+        )
+
     # Small number of test cases for head_dim = 256
     _test_trtllm_batch_decode(
         "trtllm-gen",
@@ -1685,6 +1701,13 @@ def test_trtllm_batch_decode_spec(
         pytest.skip(
             f"nvfp4 KV cache only supports page_size=32 and 64, got {page_size}. "
             "E2M1 kernels from TensorRT-LLM do not include page_size=16."
+        )
+
+    # nvfp4 KV cache does not support enable_sink=True (E2M1 kernels from TensorRT-LLM)
+    if kv_dtype == "nvfp4" and enable_sink:
+        pytest.skip(
+            "nvfp4 KV cache does not support enable_sink=True. "
+            "E2M1 kernels from TensorRT-LLM only support PersistentContext and StaticContext."
         )
 
     _test_trtllm_batch_decode(
