@@ -911,6 +911,9 @@ def _test_trtllm_batch_decode(
     sm_scale = float(1.0 / (head_dim**0.5))
 
     # Build reference output
+    # For NVFP4 KV cache, use uint8 as kv_data_type (the actual storage type)
+    # ref_kv_cache.dtype is float32 (dequantized), but the actual kv_cache is uint8
+    kv_data_type_for_plan = torch.uint8 if kv_dtype == "nvfp4" else ref_kv_cache.dtype
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -920,7 +923,7 @@ def _test_trtllm_batch_decode(
         "head_dim": head_dim,
         "page_size": page_size,
         "pos_encoding_mode": "NONE",
-        "kv_data_type": ref_kv_cache.dtype,
+        "kv_data_type": kv_data_type_for_plan,
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
@@ -983,8 +986,17 @@ def _test_trtllm_batch_decode(
         mask = None
 
     # Run decode function call with specified backend
-    bmm1_scale = q_scale * k_scale * sm_scale
-    bmm2_scale = v_scale / o_scale
+    # For NVFP4 KV cache, k_scale and v_scale are tensors, not scalars
+    # They are passed separately as k_scale_factor and v_scale_factor
+    # So we use 1.0 for bmm1_scale and bmm2_scale when using NVFP4
+    if kv_dtype == "nvfp4":
+        bmm1_scale = (
+            q_scale * sm_scale
+        )  # k_scale is handled separately via k_scale_factor
+        bmm2_scale = 1.0 / o_scale  # v_scale is handled separately via v_scale_factor
+    else:
+        bmm1_scale = q_scale * k_scale * sm_scale
+        bmm2_scale = v_scale / o_scale
     if isinstance(bmm1_scale, torch.Tensor) and not device_scale:
         bmm1_scale = bmm1_scale.item()
     elif not isinstance(bmm1_scale, torch.Tensor) and device_scale:
@@ -999,6 +1011,22 @@ def _test_trtllm_batch_decode(
         q_input = make_query_non_contiguous(q, num_qo_heads, head_dim)
     else:
         q_input = q.contiguous()
+
+    # Pass scale factors for NVFP4 KV cache
+    # Note: In decode.py, NHD layout is converted to HND by transposing k_cache and v_cache
+    # So we need to transpose scale factors accordingly to match the transposed cache shapes
+    if kv_dtype == "nvfp4":
+        if kv_layout == "NHD":
+            # For NHD layout, decode.py will transpose cache from [..., N, H, D] to [..., H, N, D]
+            # So we need to transpose scale factors from [..., N, H, head_dim//16] to [..., H, N, head_dim//16]
+            k_scale_factor = k_scale.transpose(-3, -2)
+            v_scale_factor = v_scale.transpose(-3, -2)
+        else:  # HND layout
+            k_scale_factor = k_scale
+            v_scale_factor = v_scale
+    else:
+        k_scale_factor = None
+        v_scale_factor = None
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
@@ -1023,6 +1051,8 @@ def _test_trtllm_batch_decode(
         mask=mask,
         max_q_len=max_q_len if max_q_len is not None else None,
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
+        k_scale_factor=k_scale_factor,
+        v_scale_factor=v_scale_factor,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -1161,6 +1191,8 @@ def _test_trtllm_batch_decode(
         ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
+        ("bf16", "nvfp4", "bf16"),
+        ("fp16", "nvfp4", "fp16"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
@@ -1189,6 +1221,10 @@ def test_trtllm_batch_decode(
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
+
+    # xqa backend does not support nvfp4 KV cache
+    if backend == "xqa" and kv_dtype == "nvfp4":
+        pytest.skip("xqa backend does not support nvfp4 KV cache")
 
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
