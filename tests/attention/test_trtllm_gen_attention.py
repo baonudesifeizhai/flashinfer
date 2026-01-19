@@ -110,9 +110,12 @@ def create_kv_cache(
     num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
     num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
-    if kv_dtype != "fp8":  # for fp8, create with high precision to generate scale.
+    if kv_dtype not in [
+        "fp8",
+        "nvfp4",
+    ]:  # for fp8 and nvfp4, create with high precision to generate scale.
         assert kv_dtype == ref_kv_dtype, (
-            "kv_dtype and ref_kv_dtype must be the same for non-fp8 kv_cache"
+            "kv_dtype and ref_kv_dtype must be the same for non-fp8/non-nvfp4 kv_cache"
         )
 
     # Create cache with appropriate layout
@@ -165,6 +168,70 @@ def create_kv_cache(
             ],
             dim=1,
         )
+    elif kv_dtype == "nvfp4":
+        # Quantize to NVFP4 format using FlashInfer's fp4_quantize
+        import flashinfer.fp4_quantization as fp4_quant
+
+        # Reshape to 2D [total_tokens, head_dim] for quantization
+        k_cache_flat = k_cache.reshape(-1, head_dim)
+        v_cache_flat = v_cache.reshape(-1, head_dim)
+
+        # Global scale factor of 1.0
+        global_scale = torch.tensor([1.0], dtype=torch.float32, device=k_cache.device)
+
+        # Quantize K cache with linear layout (is_sf_swizzled_layout=False)
+        k_cache_nvfp4_flat, k_scale_flat = fp4_quant.fp4_quantize(
+            k_cache_flat,
+            global_scale,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,  # Use linear layout for KV cache
+            is_sf_8x4_layout=False,
+            enable_pdl=None,
+        )
+
+        # Quantize V cache with linear layout
+        v_cache_nvfp4_flat, v_scale_flat = fp4_quant.fp4_quantize(
+            v_cache_flat,
+            global_scale,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,  # Use linear layout for KV cache
+            is_sf_8x4_layout=False,
+            enable_pdl=None,
+        )
+
+        # Reshape back to original shape (head_dim becomes head_dim // 2 for uint8)
+        k_cache_nvfp4 = k_cache_nvfp4_flat.reshape(*k_cache.shape[:-1], head_dim // 2)
+        v_cache_nvfp4 = v_cache_nvfp4_flat.reshape(*v_cache.shape[:-1], head_dim // 2)
+
+        # Reshape scale factors: [total_tokens, head_dim // 16] -> [original_shape[:-1], head_dim // 16]
+        k_scale_shape = (*k_cache.shape[:-1], head_dim // 16)
+        v_scale_shape = (*v_cache.shape[:-1], head_dim // 16)
+        k_scale = k_scale_flat.reshape(k_scale_shape).to(torch.float8_e4m3fn)
+        v_scale = v_scale_flat.reshape(v_scale_shape).to(torch.float8_e4m3fn)
+
+        # For reference, dequantize for comparison
+        # Convert scale factors to float32 for multiplication (FP8 doesn't support direct multiplication)
+        k_scale_flat_float = k_scale_flat.to(torch.float32)
+        v_scale_flat_float = v_scale_flat.to(torch.float32)
+        k_cache_dequant_flat = cast_from_fp4(
+            k_cache_nvfp4_flat.view(torch.uint8)
+        ).reshape(-1, head_dim // 16, 16) * k_scale_flat_float.reshape(
+            -1, head_dim // 16, 1
+        )
+        v_cache_dequant_flat = cast_from_fp4(
+            v_cache_nvfp4_flat.view(torch.uint8)
+        ).reshape(-1, head_dim // 16, 16) * v_scale_flat_float.reshape(
+            -1, head_dim // 16, 1
+        )
+        k_cache_dequant = k_cache_dequant_flat.reshape(k_cache.shape)
+        v_cache_dequant = v_cache_dequant_flat.reshape(v_cache.shape)
+        ref_kv_cache = torch.stack([k_cache_dequant, v_cache_dequant], dim=1)
+
+        # Update k_cache and v_cache to NVFP4 format
+        k_cache = k_cache_nvfp4
+        v_cache = v_cache_nvfp4
     else:
         k_scale = v_scale = 1.0
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
