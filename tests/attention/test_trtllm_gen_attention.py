@@ -212,10 +212,10 @@ def create_kv_cache(
         v_scale = v_scale_flat.reshape(v_scale_shape).to(torch.float8_e4m3fn)
 
         # For reference, dequantize for comparison
-        k_cache_dequant_flat = fp4_quant.cast_from_fp4(
+        k_cache_dequant_flat = cast_from_fp4(
             k_cache_nvfp4_flat.view(torch.uint8)
         ).reshape(-1, head_dim // 16, 16) * k_scale_flat.reshape(-1, head_dim // 16, 1)
-        v_cache_dequant_flat = fp4_quant.cast_from_fp4(
+        v_cache_dequant_flat = cast_from_fp4(
             v_cache_nvfp4_flat.view(torch.uint8)
         ).reshape(-1, head_dim // 16, 16) * v_scale_flat.reshape(-1, head_dim // 16, 1)
         k_cache_dequant = k_cache_dequant_flat.reshape(k_cache.shape)
