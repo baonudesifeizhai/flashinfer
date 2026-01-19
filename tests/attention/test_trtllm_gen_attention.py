@@ -1226,6 +1226,14 @@ def test_trtllm_batch_decode(
     if backend == "xqa" and kv_dtype == "nvfp4":
         pytest.skip("xqa backend does not support nvfp4 KV cache")
 
+    # nvfp4 KV cache only supports page_size=32 and 64 (E2M1 kernels from TensorRT-LLM)
+    # See tests/test_artifacts.py for available kernel list
+    if kv_dtype == "nvfp4" and page_size not in [32, 64]:
+        pytest.skip(
+            f"nvfp4 KV cache only supports page_size=32 and 64, got {page_size}. "
+            "E2M1 kernels from TensorRT-LLM do not include page_size=16."
+        )
+
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
         backend,
@@ -1353,6 +1361,12 @@ def test_trtllm_batch_decode_head_dim_256(
     head_dim,
     device_scale,
 ):
+    # nvfp4 KV cache only supports page_size=32 and 64 (E2M1 kernels from TensorRT-LLM)
+    if kv_dtype == "nvfp4" and page_size not in [32, 64]:
+        pytest.skip(
+            f"nvfp4 KV cache only supports page_size=32 and 64, got {page_size}. "
+            "E2M1 kernels from TensorRT-LLM do not include page_size=16."
+        )
     # Small number of test cases for head_dim = 256
     _test_trtllm_batch_decode(
         "trtllm-gen",
@@ -1662,6 +1676,17 @@ def test_trtllm_batch_decode_spec(
     max_in_kv_len,
     head_dim,
 ):
+    # xqa backend does not support nvfp4 KV cache
+    if backend == "xqa" and kv_dtype == "nvfp4":
+        pytest.skip("xqa backend does not support nvfp4 KV cache")
+
+    # nvfp4 KV cache only supports page_size=32 and 64 (E2M1 kernels from TensorRT-LLM)
+    if kv_dtype == "nvfp4" and page_size not in [32, 64]:
+        pytest.skip(
+            f"nvfp4 KV cache only supports page_size=32 and 64, got {page_size}. "
+            "E2M1 kernels from TensorRT-LLM do not include page_size=16."
+        )
+
     _test_trtllm_batch_decode(
         backend,
         kv_layout,
