@@ -212,12 +212,19 @@ def create_kv_cache(
         v_scale = v_scale_flat.reshape(v_scale_shape).to(torch.float8_e4m3fn)
 
         # For reference, dequantize for comparison
+        # Convert scale factors to float32 for multiplication (FP8 doesn't support direct multiplication)
+        k_scale_flat_float = k_scale_flat.to(torch.float32)
+        v_scale_flat_float = v_scale_flat.to(torch.float32)
         k_cache_dequant_flat = cast_from_fp4(
             k_cache_nvfp4_flat.view(torch.uint8)
-        ).reshape(-1, head_dim // 16, 16) * k_scale_flat.reshape(-1, head_dim // 16, 1)
+        ).reshape(-1, head_dim // 16, 16) * k_scale_flat_float.reshape(
+            -1, head_dim // 16, 1
+        )
         v_cache_dequant_flat = cast_from_fp4(
             v_cache_nvfp4_flat.view(torch.uint8)
-        ).reshape(-1, head_dim // 16, 16) * v_scale_flat.reshape(-1, head_dim // 16, 1)
+        ).reshape(-1, head_dim // 16, 16) * v_scale_flat_float.reshape(
+            -1, head_dim // 16, 1
+        )
         k_cache_dequant = k_cache_dequant_flat.reshape(k_cache.shape)
         v_cache_dequant = v_cache_dequant_flat.reshape(v_cache.shape)
         ref_kv_cache = torch.stack([k_cache_dequant, v_cache_dequant], dim=1)
@@ -976,8 +983,17 @@ def _test_trtllm_batch_decode(
         mask = None
 
     # Run decode function call with specified backend
-    bmm1_scale = q_scale * k_scale * sm_scale
-    bmm2_scale = v_scale / o_scale
+    # For NVFP4 KV cache, k_scale and v_scale are tensors, not scalars
+    # They are passed separately as k_scale_factor and v_scale_factor
+    # So we use 1.0 for bmm1_scale and bmm2_scale when using NVFP4
+    if kv_dtype == "nvfp4":
+        bmm1_scale = (
+            q_scale * sm_scale
+        )  # k_scale is handled separately via k_scale_factor
+        bmm2_scale = 1.0 / o_scale  # v_scale is handled separately via v_scale_factor
+    else:
+        bmm1_scale = q_scale * k_scale * sm_scale
+        bmm2_scale = v_scale / o_scale
     if isinstance(bmm1_scale, torch.Tensor) and not device_scale:
         bmm1_scale = bmm1_scale.item()
     elif not isinstance(bmm1_scale, torch.Tensor) and device_scale:
