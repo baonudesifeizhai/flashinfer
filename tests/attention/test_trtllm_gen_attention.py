@@ -911,8 +911,15 @@ def _test_trtllm_batch_decode(
     sm_scale = float(1.0 / (head_dim**0.5))
 
     # Build reference output
-    # For reference wrapper, use ref_kv_cache.dtype (float32 for nvfp4, actual dtype for others)
-    # For actual trtllm-gen wrapper, use uint8 for nvfp4 (the actual storage type)
+    # For nvfp4, ref_kv_cache is float32 (dequantized), but reference wrapper doesn't support float32
+    # Convert to ref_q.dtype (bf16/fp16) for reference wrapper compatibility
+    if kv_dtype == "nvfp4":
+        ref_kv_cache_for_wrapper = ref_kv_cache.to(ref_q.dtype)
+        kv_data_type_for_ref = ref_q.dtype
+    else:
+        ref_kv_cache_for_wrapper = ref_kv_cache
+        kv_data_type_for_ref = ref_kv_cache.dtype
+
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -922,7 +929,7 @@ def _test_trtllm_batch_decode(
         "head_dim": head_dim,
         "page_size": page_size,
         "pos_encoding_mode": "NONE",
-        "kv_data_type": ref_kv_cache.dtype,  # Use ref_kv_cache dtype for reference wrapper
+        "kv_data_type": kv_data_type_for_ref,  # Use converted dtype for reference wrapper
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
@@ -932,7 +939,7 @@ def _test_trtllm_batch_decode(
                 workspace_buffer_ref, kv_layout, use_tensor_cores=True
             )
             wrapper_ref.plan(**plan_params)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            output_ref = wrapper_ref.run(ref_q, ref_kv_cache_for_wrapper)
 
         else:
             # speculative decoding test
@@ -952,11 +959,12 @@ def _test_trtllm_batch_decode(
                 }
             )
             wrapper_ref.plan(**plan_params_prefill)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            output_ref = wrapper_ref.run(ref_q, ref_kv_cache_for_wrapper)
     else:
         # Construct flat K/V via helper
+        # Use ref_kv_cache_for_wrapper for consistency (converted to ref_q.dtype for nvfp4)
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
-            ref_kv_cache,
+            ref_kv_cache_for_wrapper,
             page_table,
             seq_lens.to(GPU_DEVICE),
             page_size,
