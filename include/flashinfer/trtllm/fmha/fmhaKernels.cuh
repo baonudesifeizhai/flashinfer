@@ -678,7 +678,9 @@ class TllmGenFmhaKernel {
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
     // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-    if (mDtypeQ != mDtypeKv || mDtypeOut == DATA_TYPE_E2M1) {
+    // Keep the legacy conservative path for single-token FP4 decode, but let
+    // multi-token FP4 decode use the regular heuristic path.
+    if (mDtypeQ != mDtypeKv || (mDtypeOut == DATA_TYPE_E2M1 && params.mMaxSeqLenQ <= 1)) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
