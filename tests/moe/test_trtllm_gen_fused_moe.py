@@ -2611,7 +2611,7 @@ def run_moe_test(
 
     # Validation checks
     assert top_k <= num_experts
-    assert top_k <= 22
+    assert top_k <= 32
     if (top_k_groups is not None) and (n_groups is not None) and (n_groups > 0):
         assert top_k_groups <= 4
         assert num_experts > n_groups
@@ -2934,6 +2934,35 @@ def test_renormalize_routing(
         activation_type,
         cache_permute_indices,
         zero_hidden_states=zero_hidden_states,
+    )
+
+
+def test_renormalize_routing_large_experts(cache_permute_indices):
+    run_moe_test(
+        num_tokens=1,
+        hidden_size=128,
+        intermediate_size=128,
+        moe_impl=BF16Moe(),
+        routing_config={
+            "num_experts": 2048,
+            "top_k": 32,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [BF16Moe],
+            "compatible_intermediate_size": [128],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.BlockMajorK,
+            "compatible_moe_impls": [BF16Moe],
+        },
+        activation_type=ActivationType.Swiglu.value,
+        cache_permute_indices=cache_permute_indices,
     )
 
 

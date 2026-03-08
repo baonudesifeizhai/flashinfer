@@ -18,10 +18,10 @@
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <tensorrt_llm/common/cudaUtils.h>
 
 #include "IntFastDiv.h"
-#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
-#include "flashinfer/trtllm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace moe::dev {
 
@@ -50,13 +50,14 @@ struct DataBase {
   // dim: [mNumTokens * mTopK]
   int32_t* mPtrExpandedIdxToPermutedIdx{nullptr};
   // optional: if `nullptr`, it is not filled
-  // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
+  // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
   int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
   // optional: if `nullptr`, it is not filled
-  // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
+  // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
   // Note: this array (mPtrPermutedIdxToTokenIdx) is uninitialized
   // Any out-of-bounds values are undefined.
   int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
+
   // optional: if `nullptr`, it is not filled
   // dim: [mNumTokens, mTopK]
   // When mPtrTopKIds is provided, mPtrTopKWeights must be also provided as inputs.
@@ -104,13 +105,15 @@ struct DataBase {
   int32_t mNumLocalExperts;
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_,
+          bool isPow2_, bool UsePdl_>
 struct KernelParamsBase {
   using InputT = InputT_;
   using OutputT = OutputT_;
   static constexpr int MaxNumExperts = MaxNumExperts_;
-  static constexpr bool isPow2 = isPow2_;
+  static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
   static constexpr bool UsePdl = UsePdl_;
+  static constexpr bool isPow2 = isPow2_;
 
   // Public pointer members
   int32_t* mPtrExpertCounts = nullptr;
@@ -166,8 +169,7 @@ namespace routingDeepSeek {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
-  tg::Dtype mDtypeBias{tg::Dtype::Bfloat16};
-  tg::Dtype mDtypeScore{tg::Dtype::Fp32};
+
   //
   // Grouped Gemm Launch Config Buffers
   //
@@ -181,15 +183,14 @@ struct Data : public DataBase {
   bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename BiasT_, typename OutputT_, int MaxNumExperts_,
-          int MaxNumTopExperts_, bool UseGroups_, bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_> {
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_,
+          bool UseGroups_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_,
+                                              isPow2_, UsePdl_> {
   using InputT = InputT_;
-  using BiasT = BiasT_;
   using OutputT = OutputT_;
 
   static constexpr bool UseGroups = UseGroups_;
-  static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
 
   PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
@@ -197,7 +198,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
   // Note: this variable(mPtrTopKWeightsFull) might need to be added back for the low-latency
   // kernels for MoE in tllm-gen in the future
 
-  BiasT const* mPtrRoutingBias = nullptr;
+  OutputT const* mPtrRoutingBias = nullptr;
 
   int32_t mNumExpertGroups = 0;
   int32_t mNumExpertsPerGroup = 0;
@@ -213,7 +214,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
     params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*)data.mPtrTopKPacked;
 
     // params.mPtrTopKWeightsFull = static_cast<OutputT*>(data.mPtrTopKWeightsFull);
-    params.mPtrRoutingBias = static_cast<BiasT const*>(data.mPtrRoutingBias);
+    params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
 
     params.mNumExpertGroups = data.mNumExpertGroups;
     params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
@@ -239,8 +240,10 @@ struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_> {
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_,
+          bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_,
+                                              isPow2_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
@@ -274,12 +277,17 @@ struct Data : public DataBase {
 
   bool mDoSoftmaxBeforeTopK{false};
   bool mNormTopkProb{true};  // Default value is true for Qwen3 model
-  bool mApplySoftmaxAfterTopK{false};
+  // If true, applies softmax normalization after selecting top-K experts.
+  // Use this for models that require post-selection normalization (e.g., specific Qwen variants).
+  // Mutually exclusive with mDoSoftmaxBeforeTopK when both normalization paths are active.
+  // NOTE: Don't need to use this variable for now.
+  bool mApplySoftmaxAfterTopK{true};
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool DoSoftmaxBeforeTopK_,
-          bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_> {
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_,
+          bool DoSoftmaxBeforeTopK_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_,
+                                              isPow2_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 

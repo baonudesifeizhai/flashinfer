@@ -17,65 +17,117 @@
 #pragma once
 
 #include <cuda.h>
-
-#include <iostream>
-#include <string>
-
-#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
-#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
-// #include <cuda_runtime_api.h>
+#include <cuda_runtime_api.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_size.h>
 #include <cutlass/numeric_types.h>
+#include <tensorrt_llm/common/assert.h>
+#include <tensorrt_llm/common/cudaUtils.h>
 
-#include "../../exception.h"
-// #include <tensorrt_llm/common/assert.h>
-#include "flashinfer/trtllm/common/cudaUtils.h"
-#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 
 namespace moe::dev {
 
-#define CHECK_CUDA_ERROR(cmd)                                                                \
-  do {                                                                                       \
-    cudaError_t e = cmd;                                                                     \
-    if (e != cudaSuccess) {                                                                  \
-      std::cout << "CUDA error in " << __FILE__ << ":" << __LINE__ << " executing '" << #cmd \
-                << "': " << cudaGetErrorString(e);                                           \
-    }                                                                                        \
-    FLASHINFER_CHECK(e == cudaSuccess, "Got CUDA error. See above for details.");            \
-  } while (0)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define LAUNCH_ESC(...) __VA_ARGS__
 
 #define LAUNCH_PDL(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream) \
-  cudaLaunchConfig_t config{};                                                               \
-  config.gridDim = numBlocks;                                                                \
-  config.blockDim = numThreads;                                                              \
-  config.dynamicSmemBytes = smemSize;                                                        \
-  config.stream = (cudaStream_t)stream;                                                      \
+  do {                                                                                       \
+    cudaLaunchConfig_t config{};                                                             \
+    config.gridDim = numBlocks;                                                              \
+    config.blockDim = numThreads;                                                            \
+    config.dynamicSmemBytes = smemSize;                                                      \
+    config.stream = (cudaStream_t)stream;                                                    \
                                                                                              \
-  cudaLaunchAttribute attributes[2] = {};                                                    \
-  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                     \
-  attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);              \
-  attributes[1].id = cudaLaunchAttributeCooperative;                                         \
-  attributes[1].val.cooperative = int(coopLaunch);                                           \
-  config.attrs = attributes;                                                                 \
-  config.numAttrs = 2;                                                                       \
-  if (data.mUsePdl) {                                                                        \
-    auto params = KernelParams<types, true>::setKernelParams(data);                          \
-    auto kernelTyped = kernel<KernelParams<types, true>>;                                    \
-    if (smemSize > 48 * 1024)                                                                \
-      CHECK_CUDA_ERROR(cudaFuncSetAttribute(                                                 \
-          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));              \
-    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, params));                      \
-  } else {                                                                                   \
-    auto params = KernelParams<types, false>::setKernelParams(data);                         \
-    auto kernelTyped = kernel<KernelParams<types, false>>;                                   \
-    if (smemSize > 48 * 1024)                                                                \
-      CHECK_CUDA_ERROR(cudaFuncSetAttribute(                                                 \
-          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));              \
-    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, params));                      \
+    cudaLaunchAttribute attributes[2] = {};                                                  \
+    attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                   \
+    attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);            \
+    attributes[1].id = cudaLaunchAttributeCooperative;                                       \
+    attributes[1].val.cooperative = int(coopLaunch);                                         \
+    config.attrs = attributes;                                                               \
+    config.numAttrs = 2;                                                                     \
+    if (data.mUsePdl) {                                                                      \
+      auto params = KernelParams<types, true>::setKernelParams(data);                        \
+      auto kernelTyped = kernel<KernelParams<types, true>>;                                  \
+      if (smemSize > 48 * 1024)                                                              \
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(                                                \
+            kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));            \
+      TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelTyped, params));                     \
+    } else {                                                                                 \
+      auto params = KernelParams<types, false>::setKernelParams(data);                       \
+      auto kernelTyped = kernel<KernelParams<types, false>>;                                 \
+      if (smemSize > 48 * 1024)                                                              \
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(                                                \
+            kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));            \
+      TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelTyped, params));                     \
+    }                                                                                        \
+  } while (0)
+
+#define ADJUST_NUM_BLOCKS(data, kernel, type, numThreads)                           \
+  int ctasPerSM = 0;                                                                \
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctasPerSM, kernel, numThreads, 0); \
+                                                                                    \
+  auto multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();        \
+  auto numCtasPerWave = multiProcessorCount * ctasPerSM;                            \
+                                                                                    \
+  auto numCtasPerToken = std::max(1, numCtasPerWave / data.numTokens);              \
+  int32_t finalizeElemPerThread = 128 / cutlass::sizeof_bits<type>::value;          \
+                                                                                    \
+  if (data.hiddenDim % (numCtasPerToken * finalizeElemPerThread) != 0) {            \
+    int optimalCtasPerToken = 1;                                                    \
+    for (int i = numCtasPerToken; i > 0; --i) {                                     \
+      if (data.hiddenDim % (i * finalizeElemPerThread) == 0) {                      \
+        optimalCtasPerToken = i;                                                    \
+        break;                                                                      \
+      }                                                                             \
+    }                                                                               \
+    numCtasPerToken = optimalCtasPerToken;                                          \
+  }                                                                                 \
+                                                                                    \
+  params.hiddenDimPerBlock = data.hiddenDim / numCtasPerToken;                      \
+  config.gridDim = dim3(data.numTokens, numCtasPerToken);
+
+#define LAUNCH_PDL_ADJUSTED_NUM_BLOCKS(data, adjustNumBlocks, coopLaunch, types, kernel, \
+                                       numBlocks, numThreads, smemSize, stream)          \
+  cudaLaunchConfig_t config{};                                                           \
+  config.gridDim = numBlocks;                                                            \
+  config.blockDim = numThreads;                                                          \
+  config.dynamicSmemBytes = smemSize;                                                    \
+  config.stream = (cudaStream_t)stream;                                                  \
+                                                                                         \
+  cudaLaunchAttribute attributes[2] = {};                                                \
+  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                 \
+  attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);          \
+  attributes[1].id = cudaLaunchAttributeCooperative;                                     \
+  attributes[1].val.cooperative = int(coopLaunch);                                       \
+  config.attrs = attributes;                                                             \
+  config.numAttrs = 2;                                                                   \
+  if (data.mUsePdl) {                                                                    \
+    auto params = KernelParams<types, true>::setKernelParams(data);                      \
+    auto kernelTyped = kernel<KernelParams<types, true>>;                                \
+    if (smemSize > 48 * 1024) {                                                          \
+      TLLM_CUDA_CHECK(cudaFuncSetAttribute(                                              \
+          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));          \
+    }                                                                                    \
+    if (adjustNumBlocks) {                                                               \
+      ADJUST_NUM_BLOCKS(data, kernelTyped, LAUNCH_ESC(KernelParams<types, true>::Type),  \
+                        numThreads);                                                     \
+    }                                                                                    \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelTyped, params));                   \
+  } else {                                                                               \
+    auto params = KernelParams<types, false>::setKernelParams(data);                     \
+    auto kernelTyped = kernel<KernelParams<types, false>>;                               \
+    if (smemSize > 48 * 1024) {                                                          \
+      TLLM_CUDA_CHECK(cudaFuncSetAttribute(                                              \
+          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));          \
+    }                                                                                    \
+    if (adjustNumBlocks) {                                                               \
+      ADJUST_NUM_BLOCKS(data, kernelTyped, LAUNCH_ESC(KernelParams<types, true>::Type),  \
+                        numThreads);                                                     \
+    }                                                                                    \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelTyped, params));                   \
   }
 
 #define LAUNCH(data, kernel, numBlocks, numThreads, smemSize, stream)                              \
@@ -87,7 +139,7 @@ namespace moe::dev {
   } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                              \
     LAUNCH_PDL(data, false, cutlass::bfloat16_t, kernel, numBlocks, numThreads, smemSize, stream); \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported dtypeElt");                                                       \
+    TLLM_LOG_ERROR("Unsupported dtypeElt");                                                        \
   }
 
 #define LAUNCH_NUM_TOKENS_PER_CTA(data, type, numTokensPerCta, kernel, numBlocks, numThreads,      \
@@ -99,7 +151,7 @@ namespace moe::dev {
   } else if (numTokensPerCta == 1) {                                                               \
     LAUNCH_PDL(data, false, LAUNCH_ESC(type, 1), kernel, numBlocks, numThreads, smemSize, stream); \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported numTokensPerCta");                                                \
+    TLLM_LOG_ERROR("Unsupported numTokensPerCta");                                                 \
   }
 
 #define LAUNCH_ACTIVATION(data, kernel, numTokensPerCta, numBlocks, numThreads, smemSize, stream) \
@@ -113,39 +165,36 @@ namespace moe::dev {
     LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::bfloat16_t, numTokensPerCta, kernel, numBlocks,      \
                               numThreads, smemSize, stream);                                      \
   } else {                                                                                        \
-    FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
+    TLLM_LOG_ERROR("Unsupported dtypeElt");                                                       \
   }
 
-#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                  \
-  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                  \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks,          \
-               numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {           \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float, topK), kernel, numBlocks,    \
-               numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float, topK), kernel, numBlocks,      \
-               numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t, topK), kernel,       \
-               numBlocks, numThreads, smemSize, stream);                                          \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t, topK), kernel, \
-               numBlocks, numThreads, smemSize, stream);                                          \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {   \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t, topK), kernel,   \
-               numBlocks, numThreads, smemSize, stream);                                          \
-  } else {                                                                                        \
-    FLASHINFER_WARN("Unsupported pair");                                                          \
-  }
-
-#define LAUNCH_TOPK_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream) \
-  if (data.topK % 4 == 0) {                                                     \
-    LAUNCH_EXPW(data, kernel, 4, numBlocks, numThreads, smemSize, stream);      \
-  } else if (data.topK % 2 == 0) {                                              \
-    LAUNCH_EXPW(data, kernel, 2, numBlocks, numThreads, smemSize, stream);      \
-  } else {                                                                      \
-    LAUNCH_EXPW(data, kernel, 1, numBlocks, numThreads, smemSize, stream);      \
+#define LAUNCH_EXPW(data, kernel, adjustNumBlocks, numBlocks, numThreads, smemSize, stream)        \
+  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                   \
+    LAUNCH_PDL_ADJUSTED_NUM_BLOCKS(data, adjustNumBlocks, false,                                   \
+                                   LAUNCH_ESC(cutlass::half_t, float), kernel, numBlocks,          \
+                                   numThreads, smemSize, stream);                                  \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {            \
+    LAUNCH_PDL_ADJUSTED_NUM_BLOCKS(data, adjustNumBlocks, false,                                   \
+                                   LAUNCH_ESC(cutlass::float_e4m3_t, float), kernel, numBlocks,    \
+                                   numThreads, smemSize, stream);                                  \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {        \
+    LAUNCH_PDL_ADJUSTED_NUM_BLOCKS(data, adjustNumBlocks, false,                                   \
+                                   LAUNCH_ESC(cutlass::bfloat16_t, float), kernel, numBlocks,      \
+                                   numThreads, smemSize, stream);                                  \
+  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {        \
+    LAUNCH_PDL_ADJUSTED_NUM_BLOCKS(data, adjustNumBlocks, false,                                   \
+                                   LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t), kernel,       \
+                                   numBlocks, numThreads, smemSize, stream);                       \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {        \
+    LAUNCH_PDL_ADJUSTED_NUM_BLOCKS(data, adjustNumBlocks, false,                                   \
+                                   LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t), kernel, \
+                                   numBlocks, numThreads, smemSize, stream);                       \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {    \
+    LAUNCH_PDL_ADJUSTED_NUM_BLOCKS(data, adjustNumBlocks, false,                                   \
+                                   LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t), kernel,   \
+                                   numBlocks, numThreads, smemSize, stream);                       \
+  } else {                                                                                         \
+    TLLM_LOG_ERROR("Unsupported pair");                                                            \
   }
 
 #define LAUNCH_TILEN(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream)     \
@@ -157,101 +206,73 @@ namespace moe::dev {
                smemSize, stream);                                                                  \
   }
 
-#define LAUNCH_ROUTING_LLAMA4(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)   \
-  if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                        \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, 128 /* Always 128 for llama4*/),       \
+#define LAUNCH_ROUTING_LLAMA4(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream) \
+  if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                      \
+    LAUNCH_TILEN(                                                                                \
+        data, coopLaunch,                                                                        \
+        LAUNCH_ESC(float, float, 128 /* Always 128 for llama4*/, 1 /* Always 1 for llama4*/),    \
+        kernel, numBlocks, numThreads, smemSize, stream);                                        \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                           \
+    LAUNCH_TILEN(data, coopLaunch,                                                               \
+                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, 128 /* Always 128 for llama4*/,        \
+                            1 /* Always 1 for llama4*/),                                         \
+                 kernel, numBlocks, numThreads, smemSize, stream);                               \
+  } else {                                                                                       \
+    TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                     \
+  }
+
+#define LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(                                         \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag, forceFloatInput, \
+    numExperts, numTopExperts)                                                                     \
+  if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag) {                                           \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, true),      \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                 \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, false),     \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag && forceFloatInput) {             \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, true), kernel,        \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag) {                                \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, true),        \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && forceFloatInput) {                          \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, false), kernel,       \
+                 numBlocks, numThreads, smemSize, stream);                                         \
   } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                             \
     LAUNCH_TILEN(data, coopLaunch,                                                                 \
-                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, 128 /* Always 128 for llama4*/), kernel, \
-                 numBlocks, numThreads, smemSize, stream);                                         \
+                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, false),       \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                      \
-  }
-
-#define LAUNCH_ROUTING_DEEPSEEK_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads,  \
-                                                smemSize, stream, extraFlag, numExperts,          \
-                                                numTopExperts)                                    \
-  if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Fp32 &&                \
-      data.mDtypeExpW == tg::Dtype::Fp32) {                                                       \
-    LAUNCH_TILEN(data, coopLaunch,                                                                \
-                 LAUNCH_ESC(float, float, float, numExperts, numTopExperts, extraFlag), kernel,   \
-                 numBlocks, numThreads, smemSize, stream);                                        \
-  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Fp32 &&         \
-             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
-    LAUNCH_TILEN(data, coopLaunch,                                                                \
-                 LAUNCH_ESC(float, float, __nv_bfloat16, numExperts, numTopExperts, extraFlag),   \
-                 kernel, numBlocks, numThreads, smemSize, stream);                                \
-  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Bfloat16 &&     \
-             data.mDtypeExpW == tg::Dtype::Fp32) {                                                \
-    LAUNCH_TILEN(data, coopLaunch,                                                                \
-                 LAUNCH_ESC(float, __nv_bfloat16, float, numExperts, numTopExperts, extraFlag),   \
-                 kernel, numBlocks, numThreads, smemSize, stream);                                \
-  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Bfloat16 &&     \
-             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
-    LAUNCH_TILEN(                                                                                 \
-        data, coopLaunch,                                                                         \
-        LAUNCH_ESC(float, __nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, extraFlag),    \
-        kernel, numBlocks, numThreads, smemSize, stream);                                         \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Fp32 &&     \
-             data.mDtypeExpW == tg::Dtype::Fp32) {                                                \
-    LAUNCH_TILEN(data, coopLaunch,                                                                \
-                 LAUNCH_ESC(__nv_bfloat16, float, float, numExperts, numTopExperts, extraFlag),   \
-                 kernel, numBlocks, numThreads, smemSize, stream);                                \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Fp32 &&     \
-             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
-    LAUNCH_TILEN(                                                                                 \
-        data, coopLaunch,                                                                         \
-        LAUNCH_ESC(__nv_bfloat16, float, __nv_bfloat16, numExperts, numTopExperts, extraFlag),    \
-        kernel, numBlocks, numThreads, smemSize, stream);                                         \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Bfloat16 && \
-             data.mDtypeExpW == tg::Dtype::Fp32) {                                                \
-    LAUNCH_TILEN(                                                                                 \
-        data, coopLaunch,                                                                         \
-        LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, float, numExperts, numTopExperts, extraFlag),    \
-        kernel, numBlocks, numThreads, smemSize, stream);                                         \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Bfloat16 && \
-             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
-    LAUNCH_TILEN(data, coopLaunch,                                                                \
-                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, numExperts,              \
-                            numTopExperts, extraFlag),                                            \
-                 kernel, numBlocks, numThreads, smemSize, stream);                                \
-  } else {                                                                                        \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                     \
-  }
-
-#define LAUNCH_ROUTING_DEEPSEEK_IMPL(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,  \
-                                     stream, extraFlag, numExperts, numTopExperts)               \
-  if (extraFlag) {                                                                               \
-    LAUNCH_ROUTING_DEEPSEEK_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads,     \
-                                            smemSize, stream, true, numExperts, numTopExperts);  \
-  } else {                                                                                       \
-    LAUNCH_ROUTING_DEEPSEEK_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads,     \
-                                            smemSize, stream, false, numExperts, numTopExperts); \
+    TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                       \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define LAUNCH_ROUTING_WITH_NUM_EXPERTS(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
-                                        stream, extraFlag1, numExperts)                            \
+                                        stream, extraFlag1, numExperts, numTopExperts)             \
   if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1) {                                          \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, true), kernel, numBlocks,  \
-                 numThreads, smemSize, stream);                                                    \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, true),      \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                 \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, false), kernel, numBlocks, \
-                 numThreads, smemSize, stream);                                                    \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, false),     \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag1) {                               \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, true),     \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, true),        \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                             \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, false),    \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, false),       \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                      \
+    TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                       \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
 namespace activation {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -471,11 +492,10 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
 };
 
-template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UsePdl_>
+template <typename Type_, typename TypeExpW_, bool UsePdl_>
 struct KernelParams {
   using Type = Type_;
   using TypeExpW = TypeExpW_;
-  static constexpr int TopKUnrollFactor = TopKUnrollFactor_;
   static constexpr bool UsePdl = UsePdl_;
 
   Type const* inPtr;
@@ -493,6 +513,7 @@ struct KernelParams {
   int32_t numExperts;
   int32_t topK;
   int32_t const* totalNumPaddedTokens;
+  int32_t hiddenDimPerBlock;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -511,7 +532,7 @@ struct KernelParams {
     params.numExperts = data.numExperts;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
-
+    params.hiddenDimPerBlock = 1;
     return params;
   }
 };

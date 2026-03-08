@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
 
 namespace moe::dev::routing {
@@ -25,7 +24,8 @@ namespace routingLlama4 {
 static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int MaxNumTopExperts = 1;
-static constexpr int NumExpertsLimit = 128;
+// static constexpr int MaxNumExperts = 128;
+static constexpr int MaxSupportedExperts = 128;
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 static constexpr int WarpKernelSmemStride = 33;
@@ -241,6 +241,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     } else {
       permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
+
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
   }
@@ -294,7 +295,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
       auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
       auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                           (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
+                           (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
       // the permuted index: we add the local offset relative to this expert and token
       // to the global offset from the scan for this expert
       auto permutedIdx = isLocalExpert ? finalExpertOffset[ii] + localOffsetToken : int32_t{-1};
@@ -303,7 +304,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         params.mPtrExpandedIdxToPermutedIdx[tokenIdx] = permutedIdx;
       }
       // write out `mPtrPermutedIdxToExpandedIdx` if required
-      if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert && isTokenRouted) {
+      if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert) {
         params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = tokenIdx;
       }
       // write out `mPtrPermutedIdxToTokenIdx` if required
@@ -469,27 +470,30 @@ int constexpr getMaxNumExperts(int32_t numExperts) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void runImpl(Data const& data, void* stream) {
-  FLASHINFER_CHECK(
+void run(Data const& data, void* stream) {
+  TLLM_CHECK_WITH_INFO(
       data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
       "Routing kernel requires at least one input parameter");
   if (data.mPtrTopKIds != nullptr) {
-    FLASHINFER_CHECK(
+    TLLM_CHECK_WITH_INFO(
         data.mPtrTopKWeights != nullptr,
         "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 routing.");
   }
-  FLASHINFER_CHECK(
+  TLLM_CHECK_WITH_INFO(
       data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
           data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
       "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-  FLASHINFER_CHECK(data.mTopK <= MaxNumTopExperts,
-                   "Routing kernel expects topK experts <= %d, got %d", MaxNumTopExperts,
-                   data.mTopK);
-  FLASHINFER_CHECK(data.mNumExperts <= NumExpertsLimit,
-                   "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts,
-                   NumExpertsLimit);
-  FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
-                   "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
+  TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts,
+                       "Routing kernel expects topK experts <= %d, got %d", MaxNumTopExperts,
+                       data.mTopK);
+  TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExperts,
+                       "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts,
+                       MaxSupportedExperts);
+  // static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
+  // static_assert(MaxNumExperts <= numThreadsHist, "#experts must be bounded by #threads");
+  TLLM_CHECK_WITH_INFO(data.mNumExperts % 4 == 0,
+                       "Routing kernel expects #experts %d to be a multiple of 4.",
+                       data.mNumExperts);
 
   bool const useSingleWarp =
       (data.mPtrScores == nullptr && data.mNumTokens <= WarpKernelMaxNumTokens) ||
@@ -499,11 +503,11 @@ void runImpl(Data const& data, void* stream) {
                               ? MaxNumTokensSingleClusterScores
                               : MaxNumTokensSingleCluster);
   if (!useSingleCluster) {
-    FLASHINFER_CHECK(
+    TLLM_CHECK_WITH_INFO(
         (data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr),
         "When #tokens is large, `mPtrTopKPacked` or `mPtrTopKIds` is a required input.");
-    FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
-                     "When #tokens is large, `mPtrExpertCounts` is a required input.");
+    TLLM_CHECK_WITH_INFO(data.mPtrExpertCounts != nullptr,
+                         "When #tokens is large, `mPtrExpertCounts` is a required input.");
   }
 
   int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
@@ -556,23 +560,6 @@ void runImpl(Data const& data, void* stream) {
                           /*smemSize=*/0,  // No dynamic smem
                           stream);
   }
-}
-
-void run(Data const& data, void* stream) {
-  FLASHINFER_CHECK(
-      data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
-      "Routing kernel requires at least one input parameter");
-  FLASHINFER_CHECK(
-      data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
-          data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
-      "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-  FLASHINFER_CHECK(data.mTopK <= MaxNumTopExperts,
-                   "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ",
-                   data.mTopK);
-  FLASHINFER_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
-                   data.mPaddingLog2);
-
-  runImpl(data, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -77,6 +77,12 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
             # Routing kernels for moe_sort
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "routingDeepSeek/launchClusterKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "routingDeepSeek/launchCoopKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "routingDeepSeek/launchHistogramKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "routingDeepSeek/launchInitExpertCounts.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "routingDeepSeek/launchMainKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "routingDeepSeek/launchOffsetsKernel.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[
