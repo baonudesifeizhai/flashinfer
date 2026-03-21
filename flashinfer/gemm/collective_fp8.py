@@ -109,3 +109,54 @@ def fused_all_gather_bmm_fp8(
     ).squeeze(0)
 
     return gathered, mm_out
+
+
+@flashinfer_api
+def fused_bmm_fp8_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    reduce_op: str,
+    scatter_dim: int,
+    group_name: str,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Prototype dense FP8 BMM + reduce-scatter for TP-style eager execution.
+
+    This is a two-stage prototype:
+
+    1. Run FlashInfer ``bmm_fp8`` on the local shard.
+    2. Reduce-scatter the dense output with functional collectives.
+    """
+
+    _require_funcol()
+
+    if A.ndim != 2:
+        raise ValueError(
+            f"fused_bmm_fp8_reduce_scatter expects a 2D A, got shape {tuple(A.shape)}"
+        )
+    if B.ndim != 2:
+        raise ValueError(
+            f"fused_bmm_fp8_reduce_scatter expects a 2D B, got shape {tuple(B.shape)}"
+        )
+
+    out_dtype = out_dtype or torch.bfloat16
+
+    mm_out = bmm_fp8(
+        A.unsqueeze(0),
+        B.unsqueeze(0),
+        A_scale,
+        B_scale,
+        out_dtype,
+        backend="auto",
+    ).squeeze(0)
+
+    reduced = funcol.reduce_scatter_tensor(
+        mm_out,
+        reduce_op,
+        scatter_dim,
+        group_name,
+    )
+    reduced = funcol.wait_tensor(reduced)
+    return reduced
