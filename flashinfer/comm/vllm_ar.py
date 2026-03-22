@@ -80,6 +80,19 @@ def get_vllm_comm_module():
     ) -> None:
         module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
 
+    @register_custom_op(
+        "flashinfer::all_gather",
+        mutates_args=["out", "reg_buffer", "reg_buffer_sz_bytes"],
+    )
+    def all_gather(
+        fa: int,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        module.all_gather(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
         dispose=dispose,
@@ -88,6 +101,7 @@ def get_vllm_comm_module():
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
         all_reduce=all_reduce,
+        all_gather=all_gather,
     )
 
 
@@ -125,6 +139,25 @@ def all_reduce(
     get_vllm_comm_module().all_reduce(
         fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas
     )
+
+
+def all_gather(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    """Performs an out-of-place all gather.
+
+    Args:
+        fa: The handle to the custom all gather implementation.
+        inp: The input tensor to gather from the local rank.
+        out: The output tensor containing the concatenated shards.
+        reg_buffer: The IPC-registered staging buffer.
+        reg_buffer_sz_bytes: The size of the staging buffer in bytes.
+    """
+    get_vllm_comm_module().all_gather(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
 def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:

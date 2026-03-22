@@ -33,6 +33,9 @@ def _initialize_process_group(world_size, rank, distributed_init_port):
 
 
 def _run_correctness_worker(world_size, rank, distributed_init_port):
+    custom_ptr = None
+    meta_ptrs = None
+    buffer_ptrs = None
     try:
         group = _initialize_process_group(world_size, rank, distributed_init_port)
         device = torch.device(f"cuda:{rank}")
@@ -85,6 +88,69 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
                         dist.all_reduce(inp1_ref, group=group)
 
                         torch.testing.assert_close(out1, inp1_ref)
+    finally:
+        dist.barrier(group=group)
+        if custom_ptr is not None:
+            comm.vllm_dispose(custom_ptr)
+        if buffer_ptrs:
+            comm.free_shared_buffer(buffer_ptrs, group)
+        if meta_ptrs:
+            comm.free_shared_buffer(meta_ptrs, group)
+
+        dist.destroy_process_group(group=group)
+
+
+def _run_all_gather_worker(world_size, rank, distributed_init_port):
+    custom_ptr = None
+    meta_ptrs = None
+    buffer_ptrs = None
+    try:
+        group = _initialize_process_group(world_size, rank, distributed_init_port)
+        device = torch.device(f"cuda:{rank}")
+        max_size = 8192 * 1024
+        meta_ptrs = comm.create_shared_buffer(
+            comm.vllm_meta_size() + max_size, group=group
+        )
+
+        rank_data = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=device)
+        buffer_ptrs = comm.create_shared_buffer(max_size, group=group)
+
+        custom_ptr = comm.vllm_init_custom_ar(meta_ptrs, rank_data, rank, True)
+        comm.vllm_register_buffer(custom_ptr, buffer_ptrs)
+
+        test_sizes = [
+            512,
+            2560,
+            4096,
+            5120,
+            7680,
+            32768,
+            262144,
+            524288,
+        ]
+        dtypes = [torch.float32, torch.float16, torch.bfloat16]
+        test_loop = 5
+
+        for test_size in test_sizes:
+            for dtype in dtypes:
+                for _ in range(test_loop):
+                    inp = torch.randint(1, 16, (test_size,), dtype=dtype, device=device)
+                    out = torch.empty(
+                        test_size * world_size, dtype=dtype, device=device
+                    )
+                    ref = torch.empty_like(out)
+
+                    comm.vllm_all_gather(
+                        custom_ptr,
+                        inp,
+                        out,
+                        buffer_ptrs[rank],
+                        max_size,
+                    )
+
+                    dist.all_gather_into_tensor(ref, inp, group=group)
+
+                    torch.testing.assert_close(out, ref)
     finally:
         dist.barrier(group=group)
         if custom_ptr is not None:
@@ -239,6 +305,22 @@ def test_vllm_custom_allreduce(world_size):
         target_args=(),
     )
     print(f"custom allreduce tp = {world_size}: OK")
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_vllm_custom_allgather(world_size):
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
+    print(f"Running allgather test for world_size={world_size}")
+    multi_process_parallel(
+        world_size,
+        _run_all_gather_worker,
+        target_args=(),
+    )
+    print(f"custom allgather tp = {world_size}: OK")
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

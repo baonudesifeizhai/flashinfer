@@ -4,6 +4,7 @@
 #include <tvm/ffi/container/tuple.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "flashinfer/comm/vllm_custom_all_reduce.cuh"
@@ -56,6 +57,40 @@ bool _is_weak_contiguous(TensorView t) {
           numel * element_size);
 }
 
+void* prepare_reg_buffer(cudaStream_t stream, TensorView inp, fptr_t _reg_buffer,
+                         int64_t reg_buffer_sz_bytes) {
+  auto input_size = inp.numel() * get_element_size(inp);
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  if (reg_buffer) {
+    TVM_FFI_ICHECK_LE(input_size, reg_buffer_sz_bytes);
+    auto status =
+        cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream);
+    TVM_FFI_ICHECK(status == cudaSuccess);
+    return reg_buffer;
+  }
+  return inp.data_ptr();
+}
+
+template <typename Fn>
+void dispatch_custom_ar_out_dtype(DLDataType dtype, Fn&& fn, const char* op_name) {
+  switch (encode_dlpack_dtype(dtype)) {
+    case float32_code:
+      fn(static_cast<float*>(nullptr));
+      return;
+    case float16_code:
+      fn(static_cast<half*>(nullptr));
+      return;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case bfloat16_code:
+      fn(static_cast<nv_bfloat16*>(nullptr));
+      return;
+#endif
+    default:
+      throw std::runtime_error(std::string("custom ") + op_name +
+                               " only supports float32, float16 and bfloat16");
+  }
+}
+
 /**
  * Performs an out-of-place allreduce and stores result in out.
  *
@@ -73,37 +108,63 @@ void all_reduce(fptr_t _fa, TensorView inp, TensorView out, fptr_t _reg_buffer,
   TVM_FFI_ICHECK_EQ(inp.numel(), out.numel());
   TVM_FFI_ICHECK(_is_weak_contiguous(out));
   TVM_FFI_ICHECK(_is_weak_contiguous(inp));
-  auto input_size = inp.numel() * get_element_size(inp);
-  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
-  if (reg_buffer) {
-    TVM_FFI_ICHECK_LE(input_size, reg_buffer_sz_bytes);
-    auto status =
-        cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream);
-    TVM_FFI_ICHECK(status == cudaSuccess);
-  } else {
-    reg_buffer = inp.data_ptr();
-  }
+  auto reg_buffer = prepare_reg_buffer(stream, inp, _reg_buffer, reg_buffer_sz_bytes);
+  dispatch_custom_ar_out_dtype(
+      out.dtype(),
+      [&](auto* type_tag) {
+        using T = std::remove_pointer_t<decltype(type_tag)>;
+        fa->allreduce<T>(stream, reinterpret_cast<T*>(reg_buffer),
+                         reinterpret_cast<T*>(out.data_ptr()), out.numel(), num_ctas);
+      },
+      "allreduce");
+}
+
+/**
+ * Performs an out-of-place allgather and stores result in out.
+ *
+ * If _reg_buffer is null, assumes inp.data_ptr() is already IPC-registered.
+ * Otherwise, _reg_buffer is assumed to be IPC-registered and inp is first
+ * copied into _reg_buffer.
+ */
+void all_gather(fptr_t _fa, TensorView inp, TensorView out, fptr_t _reg_buffer,
+                int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  ffi::CUDADeviceGuard device_guard(inp.device().device_id);
+  auto stream = get_stream(inp.device());
+
+  TVM_FFI_ICHECK_EQ(inp.dtype(), out.dtype());
+  TVM_FFI_ICHECK(_is_weak_contiguous(out));
+  TVM_FFI_ICHECK(_is_weak_contiguous(inp));
+  TVM_FFI_ICHECK_EQ(inp.numel() * fa->world_size_, out.numel());
+  TVM_FFI_ICHECK_LE(inp.numel(), std::numeric_limits<int>::max());
+  int size = static_cast<int>(inp.numel());
+  auto reg_buffer = prepare_reg_buffer(stream, inp, _reg_buffer, reg_buffer_sz_bytes);
+
   switch (encode_dlpack_dtype(out.dtype())) {
-    case float32_code: {
-      fa->allreduce<float>(stream, reinterpret_cast<float*>(reg_buffer),
-                           reinterpret_cast<float*>(out.data_ptr()), out.numel(), num_ctas);
-      break;
-    }
-    case float16_code: {
-      fa->allreduce<half>(stream, reinterpret_cast<half*>(reg_buffer),
-                          reinterpret_cast<half*>(out.data_ptr()), out.numel(), num_ctas);
-      break;
-    }
+    case uint8_code:
+    case float8_e4m3fn_code:
+    case float8_e5m2_code:
+      fa->allgather<uint8_t>(stream, reinterpret_cast<uint8_t*>(reg_buffer),
+                             reinterpret_cast<uint8_t*>(out.data_ptr()), size);
+      return;
+    case float32_code:
+      fa->allgather<float>(stream, reinterpret_cast<float*>(reg_buffer),
+                           reinterpret_cast<float*>(out.data_ptr()), size);
+      return;
+    case float16_code:
+      fa->allgather<half>(stream, reinterpret_cast<half*>(reg_buffer),
+                          reinterpret_cast<half*>(out.data_ptr()), size);
+      return;
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case bfloat16_code: {
-      fa->allreduce<nv_bfloat16>(stream, reinterpret_cast<nv_bfloat16*>(reg_buffer),
-                                 reinterpret_cast<nv_bfloat16*>(out.data_ptr()), out.numel(),
-                                 num_ctas);
-      break;
-    }
+    case bfloat16_code:
+      fa->allgather<nv_bfloat16>(stream, reinterpret_cast<nv_bfloat16*>(reg_buffer),
+                                 reinterpret_cast<nv_bfloat16*>(out.data_ptr()), size);
+      return;
 #endif
     default:
-      throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+      throw std::runtime_error(
+          "custom allgather only supports uint8, float8_e4m3fn, float8_e5m2, "
+          "float32, float16 and bfloat16");
   }
 }
 
@@ -153,3 +214,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(meta_size, meta_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_buffer, register_buffer);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init_custom_ar, init_custom_ar);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(all_reduce, all_reduce);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(all_gather, all_gather);

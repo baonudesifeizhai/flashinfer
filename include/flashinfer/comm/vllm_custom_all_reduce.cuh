@@ -7,11 +7,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -220,6 +223,25 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+DINLINE bool is_aligned_to(const void* ptr, size_t alignment) {
+  return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) == 0;
+}
+
+template <typename T, int ngpus>
+DINLINE bool can_use_packed_gather(const T* srcs[ngpus], T* result, int size) {
+  using P = typename packed_t<T>::P;
+  if (size % P::size != 0 || !is_aligned_to(result, sizeof(P))) {
+    return false;
+  }
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    if (!is_aligned_to(srcs[i], sizeof(P))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -285,6 +307,48 @@ __global__ void __launch_bounds__(512, 1)
       }
     }
   }
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_gather_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
+                               T* __restrict__ result, int rank, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+  using P = typename packed_t<T>::P;
+  auto dp = *_dp;
+  const T* srcs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    srcs[i] = reinterpret_cast<const T*>(dp.ptrs[i]);
+  }
+
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+
+  if (can_use_packed_gather<T, ngpus>(srcs, result, size)) {
+    const P* packed_srcs[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; i++) {
+      packed_srcs[i] = reinterpret_cast<const P*>(dp.ptrs[i]);
+    }
+    auto packed_result = reinterpret_cast<P*>(result);
+    int packed_size = size / P::size;
+    for (int idx = tid; idx < packed_size; idx += stride) {
+#pragma unroll
+      for (int i = 0; i < ngpus; i++) {
+        packed_result[i * packed_size + idx] = packed_srcs[i][idx];
+      }
+    }
+  } else {
+    for (int idx = tid; idx < size; idx += stride) {
+#pragma unroll
+      for (int i = 0; i < ngpus; i++) {
+        result[i * size + idx] = srcs[i][idx];
+      }
+    }
+  }
+
+  multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
@@ -500,6 +564,51 @@ class CustomAllreduce {
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  template <typename T>
+  void allgather(cudaStream_t stream, T* input, T* output, int size, int block_limit = kMaxBlocks,
+                 int threads = 512) {
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
+                               ". Got " + std::to_string(block_limit));
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error("buffer address " +
+                                 std::to_string(reinterpret_cast<uint64_t>(input)) +
+                                 " is not registered!");
+      ptrs = it->second;
+    }
+
+    int blocks = std::min(block_limit, (size + threads - 1) / threads);
+    blocks = std::max(1, blocks);
+#define GATHER_CASE(ngpus)                                                          \
+  case ngpus: {                                                                     \
+    cross_device_gather_1stage<T, ngpus>                                            \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
+    break;                                                                          \
+  }
+
+    switch (world_size_) {
+      GATHER_CASE(2)
+      GATHER_CASE(4)
+      GATHER_CASE(6)
+      GATHER_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom allgather only supports num gpus in (2,4,6,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+    }
+#undef GATHER_CASE
   }
 
   ~CustomAllreduce() {
