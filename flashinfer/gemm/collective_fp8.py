@@ -95,8 +95,7 @@ def fused_all_gather_bmm_fp8(
         )
 
     out_dtype = out_dtype or torch.bfloat16
-    if not B.is_contiguous():
-        B = B.contiguous()
+    B = B.clone(memory_format=torch.contiguous_format)
 
     gathered = funcol.all_gather_tensor(A_shard, gather_dim, group_name)
     gathered = funcol.wait_tensor(gathered)
@@ -144,8 +143,7 @@ def fused_bmm_fp8_reduce_scatter(
         )
 
     out_dtype = out_dtype or torch.bfloat16
-    if not B.is_contiguous():
-        B = B.contiguous()
+    B = B.clone(memory_format=torch.contiguous_format)
 
     mm_out = bmm_fp8(
         A.unsqueeze(0),
