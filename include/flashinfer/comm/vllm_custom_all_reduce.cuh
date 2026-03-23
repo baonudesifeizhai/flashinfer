@@ -311,6 +311,30 @@ __global__ void __launch_bounds__(512, 1)
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_scatter_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
+                                       T* __restrict__ result, int rank, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  int part = size / ngpus;
+  int start = rank * part;
+  int end = rank == ngpus - 1 ? size : start + part;
+  const P* ptrs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    ptrs[i] = reinterpret_cast<const P*>(_dp->ptrs[i]);
+  }
+
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+  for (int idx = start + tid; idx < end; idx += stride) {
+    reinterpret_cast<P*>(result)[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+  }
+  multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
     cross_device_gather_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
                                T* __restrict__ result, int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -609,6 +633,64 @@ class CustomAllreduce {
             std::to_string(world_size_));
     }
 #undef GATHER_CASE
+  }
+
+  template <typename T>
+  void reducescatter(cudaStream_t stream, T* input, T* output, int size,
+                     int block_limit = kMaxBlocks, int threads = 512) {
+    auto d = packed_t<T>::P::size;
+    if (size % d != 0) {
+      throw std::runtime_error(
+          "custom reducescatter currently requires input length to be multiple of " +
+          std::to_string(d));
+    }
+    if (size % world_size_ != 0) {
+      throw std::runtime_error(
+          "custom reducescatter currently requires input length to be divisible by world size");
+    }
+    if (block_limit > kMaxBlocks) {
+      throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
+                               ". Got " + std::to_string(block_limit));
+    }
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end()) {
+        throw std::runtime_error("buffer address " +
+                                 std::to_string(reinterpret_cast<uint64_t>(input)) +
+                                 " is not registered!");
+      }
+      ptrs = it->second;
+    }
+
+    int packed_total_size = size / d;
+    int packed_part_size = packed_total_size / world_size_;
+    int blocks = std::min(block_limit, (packed_part_size + threads - 1) / threads);
+    blocks = std::max(1, blocks);
+#define REDUCE_SCATTER_CASE(ngpus)                                                               \
+  case ngpus: {                                                                                  \
+    cross_device_reduce_scatter_1stage<T, ngpus>                                                 \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, packed_total_size); \
+    break;                                                                                       \
+  }
+
+    switch (world_size_) {
+      REDUCE_SCATTER_CASE(2)
+      REDUCE_SCATTER_CASE(4)
+      REDUCE_SCATTER_CASE(6)
+      REDUCE_SCATTER_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom reducescatter only supports num gpus in (2,4,6,8). Actual num gpus = " +
+            std::to_string(world_size_));
+    }
+#undef REDUCE_SCATTER_CASE
   }
 
   ~CustomAllreduce() {

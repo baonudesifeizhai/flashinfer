@@ -168,6 +168,34 @@ void all_gather(fptr_t _fa, TensorView inp, TensorView out, fptr_t _reg_buffer,
   }
 }
 
+/**
+ * Performs an out-of-place reduce-scatter and stores the local shard in out.
+ *
+ * If _reg_buffer is null, assumes inp.data_ptr() is already IPC-registered.
+ * Otherwise, _reg_buffer is assumed to be IPC-registered and inp is first
+ * copied into _reg_buffer.
+ */
+void reduce_scatter(fptr_t _fa, TensorView inp, TensorView out, fptr_t _reg_buffer,
+                    int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  ffi::CUDADeviceGuard device_guard(inp.device().device_id);
+  auto stream = get_stream(inp.device());
+
+  TVM_FFI_ICHECK_EQ(inp.dtype(), out.dtype());
+  TVM_FFI_ICHECK(_is_weak_contiguous(out));
+  TVM_FFI_ICHECK(_is_weak_contiguous(inp));
+  TVM_FFI_ICHECK_EQ(inp.numel(), out.numel() * fa->world_size_);
+  auto reg_buffer = prepare_reg_buffer(stream, inp, _reg_buffer, reg_buffer_sz_bytes);
+  dispatch_custom_ar_out_dtype(
+      out.dtype(),
+      [&](auto* type_tag) {
+        using T = std::remove_pointer_t<decltype(type_tag)>;
+        fa->reducescatter<T>(stream, reinterpret_cast<T*>(reg_buffer),
+                             reinterpret_cast<T*>(out.data_ptr()), inp.numel());
+      },
+      "reducescatter");
+}
+
 void dispose(fptr_t _fa) { delete reinterpret_cast<vllm::CustomAllreduce*>(_fa); }
 
 int64_t meta_size() { return sizeof(vllm::Signal); }
@@ -215,3 +243,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_buffer, register_buffer);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init_custom_ar, init_custom_ar);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(all_reduce, all_reduce);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(all_gather, all_gather);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(reduce_scatter, reduce_scatter);

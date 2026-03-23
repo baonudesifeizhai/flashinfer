@@ -32,6 +32,7 @@ from .trtllm_ar import (
 )
 from .vllm_ar import all_gather as vllm_all_gather
 from .vllm_ar import all_reduce as vllm_all_reduce
+from .vllm_ar import reduce_scatter as vllm_reduce_scatter
 from .vllm_ar import dispose as vllm_dispose
 from .vllm_ar import gen_vllm_comm_module as gen_vllm_comm_module
 from .vllm_ar import get_graph_buffer_ipc_meta as vllm_get_graph_buffer_ipc_meta

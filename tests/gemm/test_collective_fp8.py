@@ -66,39 +66,37 @@ def test_fused_all_gather_bmm_fp8_smoke(monkeypatch):
 
 
 def test_fused_bmm_fp8_reduce_scatter_smoke(monkeypatch):
-    call_log = {}
+    call_log = {"bmm_fp8": [], "reduce_scatter": []}
 
     def fake_bmm_fp8(a, b, a_scale, b_scale, out_dtype, backend="auto"):
-        call_log["bmm_fp8"] = {
-            "a_shape": tuple(a.shape),
-            "b_shape": tuple(b.shape),
-            "a_scale_shape": tuple(a_scale.shape),
-            "b_scale_shape": tuple(b_scale.shape),
-            "out_dtype": out_dtype,
-            "backend": backend,
-        }
-        return torch.arange(a.shape[1] * b.shape[2], dtype=out_dtype).view(
-            a.shape[0], a.shape[1], b.shape[2]
+        call_log["bmm_fp8"].append(
+            {
+                "a_shape": tuple(a.shape),
+                "b_shape": tuple(b.shape),
+                "a_scale_shape": tuple(a_scale.shape),
+                "b_scale_shape": tuple(b_scale.shape),
+                "out_dtype": out_dtype,
+                "backend": backend,
+            }
         )
+        rows = a.shape[1]
+        cols = b.shape[2]
+        return torch.arange(rows * cols, dtype=out_dtype).view(1, rows, cols)
 
-    def fake_reduce_scatter_tensor(inp, reduce_op, scatter_dim, group_name):
-        call_log["reduce_scatter"] = {
-            "inp_shape": tuple(inp.shape),
-            "reduce_op": reduce_op,
-            "scatter_dim": scatter_dim,
-            "group_name": group_name,
-        }
-        return inp[: inp.shape[0] // 2]
-
-    def fake_wait_tensor(inp):
-        call_log["wait_tensor"] = {"inp_shape": tuple(inp.shape)}
-        return inp
+    def fake_reduce_scatter(custom_ar, inp, out, reg_buffer, reg_buffer_sz_bytes):
+        call_log["reduce_scatter"].append(
+            {
+                "custom_ar": custom_ar,
+                "inp_shape": tuple(inp.shape),
+                "out_shape": tuple(out.shape),
+                "reg_buffer": reg_buffer,
+                "reg_buffer_sz_bytes": reg_buffer_sz_bytes,
+            }
+        )
+        out.copy_(inp[: out.shape[0]])
 
     monkeypatch.setattr(collective_fp8, "bmm_fp8", fake_bmm_fp8)
-    monkeypatch.setattr(
-        collective_fp8.funcol, "reduce_scatter_tensor", fake_reduce_scatter_tensor
-    )
-    monkeypatch.setattr(collective_fp8.funcol, "wait_tensor", fake_wait_tensor)
+    monkeypatch.setattr(collective_fp8, "vllm_reduce_scatter", fake_reduce_scatter)
 
     a = torch.randn(8, 16)
     b = torch.randn(16, 32)
@@ -110,24 +108,45 @@ def test_fused_bmm_fp8_reduce_scatter_smoke(monkeypatch):
         b,
         a_scale,
         b_scale,
+        custom_ar=17,
+        reg_buffer=23,
+        reg_buffer_sz_bytes=256,
         world_size=2,
-        group_name="tp:0",
         out_dtype=torch.bfloat16,
     )
 
     assert out.shape == (4, 32)
-    assert call_log["bmm_fp8"] == {
-        "a_shape": (1, 8, 16),
-        "b_shape": (1, 16, 32),
-        "a_scale_shape": (1,),
-        "b_scale_shape": (1,),
-        "out_dtype": torch.bfloat16,
-        "backend": "auto",
-    }
-    assert call_log["reduce_scatter"] == {
-        "inp_shape": (8, 32),
-        "reduce_op": "sum",
-        "scatter_dim": 0,
-        "group_name": "tp:0",
-    }
-    assert call_log["wait_tensor"] == {"inp_shape": (4, 32)}
+    assert call_log["bmm_fp8"] == [
+        {
+            "a_shape": (1, 4, 16),
+            "b_shape": (1, 16, 32),
+            "a_scale_shape": (1,),
+            "b_scale_shape": (1,),
+            "out_dtype": torch.bfloat16,
+            "backend": "auto",
+        },
+        {
+            "a_shape": (1, 4, 16),
+            "b_shape": (1, 16, 32),
+            "a_scale_shape": (1,),
+            "b_scale_shape": (1,),
+            "out_dtype": torch.bfloat16,
+            "backend": "auto",
+        },
+    ]
+    assert call_log["reduce_scatter"] == [
+        {
+            "custom_ar": 17,
+            "inp_shape": (4, 32),
+            "out_shape": (2, 32),
+            "reg_buffer": 23,
+            "reg_buffer_sz_bytes": 256,
+        },
+        {
+            "custom_ar": 17,
+            "inp_shape": (4, 32),
+            "out_shape": (2, 32),
+            "reg_buffer": 23,
+            "reg_buffer_sz_bytes": 256,
+        },
+    ]

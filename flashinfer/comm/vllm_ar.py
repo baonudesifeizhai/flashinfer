@@ -93,6 +93,19 @@ def get_vllm_comm_module():
     ) -> None:
         module.all_gather(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
+    @register_custom_op(
+        "flashinfer::reduce_scatter",
+        mutates_args=["out", "reg_buffer", "reg_buffer_sz_bytes"],
+    )
+    def reduce_scatter(
+        fa: int,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        module.reduce_scatter(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
         dispose=dispose,
@@ -102,6 +115,7 @@ def get_vllm_comm_module():
         meta_size=meta_size,
         all_reduce=all_reduce,
         all_gather=all_gather,
+        reduce_scatter=reduce_scatter,
     )
 
 
@@ -158,6 +172,26 @@ def all_gather(
         reg_buffer_sz_bytes: The size of the staging buffer in bytes.
     """
     get_vllm_comm_module().all_gather(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+
+
+def reduce_scatter(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    """Performs an out-of-place reduce-scatter over dim 0.
+
+    Args:
+        fa: The handle to the custom reduce-scatter implementation.
+        inp: The local full tensor before scattering. The first dimension must
+            be divisible by the communicator world size.
+        out: The local reduced shard.
+        reg_buffer: The IPC-registered staging buffer.
+        reg_buffer_sz_bytes: The size of the staging buffer in bytes.
+    """
+    get_vllm_comm_module().reduce_scatter(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
 def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:

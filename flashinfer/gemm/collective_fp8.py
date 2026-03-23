@@ -17,25 +17,11 @@ limitations under the License.
 from typing import Literal, Optional
 
 import torch
-import torch.distributed._functional_collectives as funcol
-from torch.library import Library, infer_schema
 
 from ..api_logging import flashinfer_api
 from ..comm.vllm_ar import all_gather as vllm_all_gather
+from ..comm.vllm_ar import reduce_scatter as vllm_reduce_scatter
 from .gemm_base import bmm_fp8
-
-_flashinfer_collective_lib = Library("flashinfer", "FRAGMENT")
-
-
-def _direct_register_flashinfer_op(
-    op_name: str,
-    op_func,
-    fake_impl,
-) -> None:
-    schema_str = infer_schema(op_func, mutates_args=[])
-    _flashinfer_collective_lib.define(op_name + schema_str)
-    _flashinfer_collective_lib.impl(op_name, op_func, dispatch_key="CUDA")
-    _flashinfer_collective_lib._register_fake(op_name, fake_impl)
 
 
 @flashinfer_api
@@ -130,45 +116,33 @@ def fused_all_gather_bmm_fp8(
     ).squeeze(0)
 
 
-def _fused_bmm_fp8_reduce_scatter_op(
+def _maybe_slice_rows(
+    scale: torch.Tensor, start: int, end: int, rows: int
+) -> torch.Tensor:
+    if scale.ndim >= 1 and scale.shape[0] == rows:
+        return scale[start:end]
+    return scale
+
+
+@flashinfer_api
+def fused_bmm_fp8_reduce_scatter(
     A: torch.Tensor,
     B: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
+    custom_ar: int,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
     world_size: int,
-    group_name: str,
-    out_dtype: torch.dtype,
-    backend: str,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "auto",
 ) -> torch.Tensor:
-    r"""Run FlashInfer FP8 BMM and reduce-scatter the result along dim 0.
+    r"""Run FlashInfer FP8 BMM followed by custom reduce-scatter.
 
-    This is the first FlashInfer-side RS+GEMM primitive for TP-style execution.
+    This is the first RS-side FlashInfer primitive for TP-style execution.
     The implementation intentionally reuses the existing ``bmm_fp8`` kernel and
-    PyTorch functional collectives so the public API can stabilize before a
-    lower-level native RS kernel lands.
-
-    Parameters
-    ----------
-    A : torch.Tensor
-        Local activation tensor of shape ``(m, k)``.
-    B : torch.Tensor
-        Weight tensor of shape ``(k, n)`` in the layout expected by
-        ``bmm_fp8`` once unsqueezed to batched form.
-    A_scale : torch.Tensor
-        Per-tensor FP8 scale tensor for the activation.
-    B_scale : torch.Tensor
-        Per-tensor FP8 scale tensor for the weight.
-    group_name : str
-        Process-group name passed to functional reduce-scatter.
-    out_dtype : Optional[torch.dtype]
-        Output dtype passed to ``bmm_fp8``. Defaults to ``torch.bfloat16``.
-    backend : {"cudnn", "cublas", "cutlass", "auto"}
-        FlashInfer FP8 GEMM backend selection.
-
-    Returns
-    -------
-    torch.Tensor
-        Reduce-scattered GEMM output of shape ``(m / world_size, n)``.
+    the vLLM custom reduce-scatter transport so the public API can stabilize
+    before a deeper fused kernel lands.
     """
 
     if A.ndim != 2:
@@ -183,61 +157,63 @@ def _fused_bmm_fp8_reduce_scatter_op(
         raise ValueError(
             f"K dimension mismatch: A has shape {tuple(A.shape)}, B has shape {tuple(B.shape)}"
         )
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if A.shape[0] % world_size != 0:
+        raise ValueError(
+            "fused_bmm_fp8_reduce_scatter requires A.shape[0] to be divisible "
+            f"by world_size, got {A.shape[0]} and {world_size}"
+        )
+    if reg_buffer_sz_bytes <= 0:
+        raise ValueError(
+            f"reg_buffer_sz_bytes must be positive, got {reg_buffer_sz_bytes}"
+        )
 
-    mm = bmm_fp8(
-        A.unsqueeze(0),
-        B.unsqueeze(0),
-        A_scale,
-        B_scale,
-        out_dtype,
-        backend=backend,
-    ).squeeze(0)
-    rs = funcol.reduce_scatter_tensor(mm, "sum", 0, group_name)
-    return funcol.wait_tensor(rs)
+    out_dtype = out_dtype or torch.bfloat16
+    bytes_per_row = B.shape[1] * torch.empty((), dtype=out_dtype).element_size()
+    rows_per_chunk = reg_buffer_sz_bytes // bytes_per_row
+    rows_per_chunk = (rows_per_chunk // world_size) * world_size
+    if rows_per_chunk <= 0:
+        raise ValueError(
+            "reg_buffer is too small for fused_bmm_fp8_reduce_scatter: "
+            f"need at least {world_size * bytes_per_row} bytes, got {reg_buffer_sz_bytes}"
+        )
+    rows_per_chunk = min(rows_per_chunk, A.shape[0])
 
-
-def _fused_bmm_fp8_reduce_scatter_fake(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    world_size: int,
-    group_name: str,
-    out_dtype: torch.dtype,
-    backend: str,
-) -> torch.Tensor:
-    return torch.empty(
+    out = torch.empty(
         (A.shape[0] // world_size, B.shape[1]),
-        dtype=out_dtype,
         device=A.device,
+        dtype=out_dtype,
     )
+    out_row = 0
 
+    for start in range(0, A.shape[0], rows_per_chunk):
+        end = min(start + rows_per_chunk, A.shape[0])
+        a_chunk = A[start:end]
+        a_scale_chunk = _maybe_slice_rows(A_scale, start, end, A.shape[0])
+        mm_chunk = bmm_fp8(
+            a_chunk.unsqueeze(0),
+            B.unsqueeze(0),
+            a_scale_chunk,
+            B_scale,
+            out_dtype,
+            backend=backend,
+        ).squeeze(0)
 
-_direct_register_flashinfer_op(
-    "fused_bmm_fp8_reduce_scatter",
-    _fused_bmm_fp8_reduce_scatter_op,
-    _fused_bmm_fp8_reduce_scatter_fake,
-)
+        rs_rows = mm_chunk.shape[0] // world_size
+        rs_chunk = torch.empty(
+            (rs_rows, mm_chunk.shape[1]),
+            device=A.device,
+            dtype=out_dtype,
+        )
+        vllm_reduce_scatter(
+            custom_ar,
+            mm_chunk,
+            rs_chunk,
+            reg_buffer,
+            reg_buffer_sz_bytes,
+        )
+        out[out_row : out_row + rs_rows].copy_(rs_chunk)
+        out_row += rs_rows
 
-
-@flashinfer_api
-def fused_bmm_fp8_reduce_scatter(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    world_size: int,
-    group_name: str,
-    out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "auto",
-) -> torch.Tensor:
-    return torch.ops.flashinfer.fused_bmm_fp8_reduce_scatter.default(
-        A,
-        B,
-        A_scale,
-        B_scale,
-        world_size,
-        group_name,
-        out_dtype or torch.bfloat16,
-        backend,
-    )
+    return out
