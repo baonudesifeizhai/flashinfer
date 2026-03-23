@@ -110,6 +110,7 @@ def test_fused_bmm_fp8_reduce_scatter_smoke(monkeypatch):
         b,
         a_scale,
         b_scale,
+        world_size=2,
         group_name="tp:0",
         out_dtype=torch.bfloat16,
     )

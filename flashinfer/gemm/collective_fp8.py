@@ -116,15 +116,20 @@ def fused_all_gather_bmm_fp8(
     ).squeeze(0)
 
 
-@flashinfer_api
-def fused_bmm_fp8_reduce_scatter(
+@torch.library.custom_op(
+    "flashinfer::fused_bmm_fp8_reduce_scatter",
+    mutates_args=[],
+    device_types="cuda",
+)
+def _fused_bmm_fp8_reduce_scatter_op(
     A: torch.Tensor,
     B: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
+    world_size: int,
     group_name: str,
-    out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "auto",
+    out_dtype: torch.dtype,
+    backend: str,
 ) -> torch.Tensor:
     r"""Run FlashInfer FP8 BMM and reduce-scatter the result along dim 0.
 
@@ -170,8 +175,6 @@ def fused_bmm_fp8_reduce_scatter(
             f"K dimension mismatch: A has shape {tuple(A.shape)}, B has shape {tuple(B.shape)}"
         )
 
-    out_dtype = out_dtype or torch.bfloat16
-
     mm = bmm_fp8(
         A.unsqueeze(0),
         B.unsqueeze(0),
@@ -182,3 +185,44 @@ def fused_bmm_fp8_reduce_scatter(
     ).squeeze(0)
     rs = funcol.reduce_scatter_tensor(mm, "sum", 0, group_name)
     return funcol.wait_tensor(rs)
+
+
+@torch.library.register_fake("flashinfer::fused_bmm_fp8_reduce_scatter")
+def _fused_bmm_fp8_reduce_scatter_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    world_size: int,
+    group_name: str,
+    out_dtype: torch.dtype,
+    backend: str,
+) -> torch.Tensor:
+    return torch.empty(
+        (A.shape[0] // world_size, B.shape[1]),
+        dtype=out_dtype,
+        device=A.device,
+    )
+
+
+@flashinfer_api
+def fused_bmm_fp8_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    world_size: int,
+    group_name: str,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "auto",
+) -> torch.Tensor:
+    return torch.ops.flashinfer.fused_bmm_fp8_reduce_scatter.default(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        world_size,
+        group_name,
+        out_dtype or torch.bfloat16,
+        backend,
+    )
