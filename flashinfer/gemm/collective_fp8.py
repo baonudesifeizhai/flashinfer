@@ -17,6 +17,7 @@ limitations under the License.
 from typing import Literal, Optional
 
 import torch
+import torch.distributed._functional_collectives as funcol
 
 from ..api_logging import flashinfer_api
 from ..comm.vllm_ar import all_gather as vllm_all_gather
@@ -113,3 +114,71 @@ def fused_all_gather_bmm_fp8(
         out_dtype,
         backend=backend,
     ).squeeze(0)
+
+
+@flashinfer_api
+def fused_bmm_fp8_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    group_name: str,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "auto",
+) -> torch.Tensor:
+    r"""Run FlashInfer FP8 BMM and reduce-scatter the result along dim 0.
+
+    This is the first FlashInfer-side RS+GEMM primitive for TP-style execution.
+    The implementation intentionally reuses the existing ``bmm_fp8`` kernel and
+    PyTorch functional collectives so the public API can stabilize before a
+    lower-level native RS kernel lands.
+
+    Parameters
+    ----------
+    A : torch.Tensor
+        Local activation tensor of shape ``(m, k)``.
+    B : torch.Tensor
+        Weight tensor of shape ``(k, n)`` in the layout expected by
+        ``bmm_fp8`` once unsqueezed to batched form.
+    A_scale : torch.Tensor
+        Per-tensor FP8 scale tensor for the activation.
+    B_scale : torch.Tensor
+        Per-tensor FP8 scale tensor for the weight.
+    group_name : str
+        Process-group name passed to functional reduce-scatter.
+    out_dtype : Optional[torch.dtype]
+        Output dtype passed to ``bmm_fp8``. Defaults to ``torch.bfloat16``.
+    backend : {"cudnn", "cublas", "cutlass", "auto"}
+        FlashInfer FP8 GEMM backend selection.
+
+    Returns
+    -------
+    torch.Tensor
+        Reduce-scattered GEMM output of shape ``(m / world_size, n)``.
+    """
+
+    if A.ndim != 2:
+        raise ValueError(
+            f"fused_bmm_fp8_reduce_scatter expects a 2D A, got shape {tuple(A.shape)}"
+        )
+    if B.ndim != 2:
+        raise ValueError(
+            f"fused_bmm_fp8_reduce_scatter expects a 2D B, got shape {tuple(B.shape)}"
+        )
+    if A.shape[1] != B.shape[0]:
+        raise ValueError(
+            f"K dimension mismatch: A has shape {tuple(A.shape)}, B has shape {tuple(B.shape)}"
+        )
+
+    out_dtype = out_dtype or torch.bfloat16
+
+    mm = bmm_fp8(
+        A.unsqueeze(0),
+        B.unsqueeze(0),
+        A_scale,
+        B_scale,
+        out_dtype,
+        backend=backend,
+    ).squeeze(0)
+    rs = funcol.reduce_scatter_tensor(mm, "sum", 0, group_name)
+    return funcol.wait_tensor(rs)

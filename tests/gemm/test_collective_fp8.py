@@ -63,3 +63,70 @@ def test_fused_all_gather_bmm_fp8_smoke(monkeypatch):
         "out_dtype": torch.bfloat16,
         "backend": "auto",
     }
+
+
+def test_fused_bmm_fp8_reduce_scatter_smoke(monkeypatch):
+    call_log = {}
+
+    def fake_bmm_fp8(a, b, a_scale, b_scale, out_dtype, backend="auto"):
+        call_log["bmm_fp8"] = {
+            "a_shape": tuple(a.shape),
+            "b_shape": tuple(b.shape),
+            "a_scale_shape": tuple(a_scale.shape),
+            "b_scale_shape": tuple(b_scale.shape),
+            "out_dtype": out_dtype,
+            "backend": backend,
+        }
+        return torch.arange(a.shape[1] * b.shape[2], dtype=out_dtype).view(
+            a.shape[0], a.shape[1], b.shape[2]
+        )
+
+    def fake_reduce_scatter_tensor(inp, reduce_op, scatter_dim, group_name):
+        call_log["reduce_scatter"] = {
+            "inp_shape": tuple(inp.shape),
+            "reduce_op": reduce_op,
+            "scatter_dim": scatter_dim,
+            "group_name": group_name,
+        }
+        return inp[: inp.shape[0] // 2]
+
+    def fake_wait_tensor(inp):
+        call_log["wait_tensor"] = {"inp_shape": tuple(inp.shape)}
+        return inp
+
+    monkeypatch.setattr(collective_fp8, "bmm_fp8", fake_bmm_fp8)
+    monkeypatch.setattr(
+        collective_fp8.funcol, "reduce_scatter_tensor", fake_reduce_scatter_tensor
+    )
+    monkeypatch.setattr(collective_fp8.funcol, "wait_tensor", fake_wait_tensor)
+
+    a = torch.randn(8, 16)
+    b = torch.randn(16, 32)
+    a_scale = torch.ones(1)
+    b_scale = torch.ones(1)
+
+    out = collective_fp8.fused_bmm_fp8_reduce_scatter(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        group_name="tp:0",
+        out_dtype=torch.bfloat16,
+    )
+
+    assert out.shape == (4, 32)
+    assert call_log["bmm_fp8"] == {
+        "a_shape": (1, 8, 16),
+        "b_shape": (1, 16, 32),
+        "a_scale_shape": (1,),
+        "b_scale_shape": (1,),
+        "out_dtype": torch.bfloat16,
+        "backend": "auto",
+    }
+    assert call_log["reduce_scatter"] == {
+        "inp_shape": (8, 32),
+        "reduce_op": "sum",
+        "scatter_dim": 0,
+        "group_name": "tp:0",
+    }
+    assert call_log["wait_tensor"] == {"inp_shape": (4, 32)}
