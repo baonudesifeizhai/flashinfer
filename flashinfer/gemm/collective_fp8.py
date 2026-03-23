@@ -18,10 +18,24 @@ from typing import Literal, Optional
 
 import torch
 import torch.distributed._functional_collectives as funcol
+from torch.library import Library, infer_schema
 
 from ..api_logging import flashinfer_api
 from ..comm.vllm_ar import all_gather as vllm_all_gather
 from .gemm_base import bmm_fp8
+
+_flashinfer_collective_lib = Library("flashinfer", "FRAGMENT")
+
+
+def _direct_register_flashinfer_op(
+    op_name: str,
+    op_func,
+    fake_impl,
+) -> None:
+    schema_str = infer_schema(op_func, mutates_args=[])
+    _flashinfer_collective_lib.define(op_name + schema_str)
+    _flashinfer_collective_lib.impl(op_name, op_func, dispatch_key="CUDA")
+    _flashinfer_collective_lib._register_fake(op_name, fake_impl)
 
 
 @flashinfer_api
@@ -116,11 +130,6 @@ def fused_all_gather_bmm_fp8(
     ).squeeze(0)
 
 
-@torch.library.custom_op(
-    "flashinfer::fused_bmm_fp8_reduce_scatter",
-    mutates_args=[],
-    device_types="cuda",
-)
 def _fused_bmm_fp8_reduce_scatter_op(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -187,7 +196,6 @@ def _fused_bmm_fp8_reduce_scatter_op(
     return funcol.wait_tensor(rs)
 
 
-@torch.library.register_fake("flashinfer::fused_bmm_fp8_reduce_scatter")
 def _fused_bmm_fp8_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -203,6 +211,13 @@ def _fused_bmm_fp8_reduce_scatter_fake(
         dtype=out_dtype,
         device=A.device,
     )
+
+
+_direct_register_flashinfer_op(
+    "fused_bmm_fp8_reduce_scatter",
+    _fused_bmm_fp8_reduce_scatter_op,
+    _fused_bmm_fp8_reduce_scatter_fake,
+)
 
 
 @flashinfer_api
